@@ -33,6 +33,8 @@ def test_darwin_shared_import_graph_does_not_load_win32_modules():
             'ok.task.TaskExecutor',
             'ok.core.start_controller',
             'ok.device.capture',
+            'ok.device.capture_methods.screencapturekit_core',
+            'ok.device.capture_methods.screencapturekit',
             'ok.device.interaction',
             'ok.device.window_target',
             'ok.device.services.permissions',

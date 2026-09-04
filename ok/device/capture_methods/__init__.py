@@ -13,7 +13,7 @@ from ok.device.capture_methods.adb import ADBCaptureMethod
 from ok.device.capture_methods.base import BaseCaptureMethod, BaseWindowsCaptureMethod
 from ok.device.capture_methods.nemu_ipc import NemuIpcCaptureMethod
 from ok.device.capture_methods.types import ColorChannel, ImageShape, decimal, is_digit, is_valid_hwnd
-from ok.platform import WINDOWS, require_platform
+from ok.platform import MACOS, WINDOWS, require_platform
 
 
 _COMMON_EXPORTS = [
@@ -30,6 +30,13 @@ _COMMON_EXPORTS = [
 
 _LAZY_EXPORTS = {
     'ImageCaptureMethod': ('ok.device.capture_methods.image', 'ImageCaptureMethod'),
+}
+
+_MACOS_EXPORTS = {
+    'ScreenCaptureKitCaptureMethod': (
+        'ok.device.capture_methods.screencapturekit',
+        'ScreenCaptureKitCaptureMethod',
+    ),
 }
 
 _WINDOWS_EXPORTS = {
@@ -71,10 +78,16 @@ _WINDOWS_EXPORTS = {
 __all__ = [*_COMMON_EXPORTS, *_LAZY_EXPORTS]
 if sys.platform == WINDOWS:
     __all__.extend(_WINDOWS_EXPORTS)
+elif sys.platform == MACOS:
+    __all__.extend(_MACOS_EXPORTS)
 
 
 def __getattr__(name):
     target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        target = _MACOS_EXPORTS.get(name)
+        if target is not None:
+            require_platform(f'macOS capture export {name}', (MACOS,))
     if target is None:
         target = _WINDOWS_EXPORTS.get(name)
         if target is None:

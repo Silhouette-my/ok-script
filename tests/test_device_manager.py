@@ -129,7 +129,21 @@ class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
         self.assertFalse(manager.device_dict['macos']['target_bound'])
         discovery.bind.assert_not_called()
 
-    def test_macos_device_is_target_only_and_never_falls_into_adb_start(self):
+    def test_macos_device_starts_capture_but_keeps_interaction_unavailable(self):
+        class FakeCapture:
+            def __init__(self, _exit_event, target, _permission_service):
+                self.target = target
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            def connected(self):
+                return True
+
+            def diagnostics(self):
+                return SimpleNamespace(state=SimpleNamespace(value='running'))
+
         manager = DeviceManager.__new__(DeviceManager)
         manager.macos_window_config = {'title_patterns': ['Game']}
         manager.device_dict = {
@@ -142,21 +156,35 @@ class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
         manager.config = {'preferred': 'macos'}
         manager.window_target = Mock()
         manager.window_target.exists.return_value = True
+        manager.window_target.snapshot = SimpleNamespace(exists=True, candidate=None)
+        manager.window_discovery = Mock()
+        manager.permission_service = Mock()
+        manager.exit_event = Mock()
         manager.capture_method = Mock()
         previous_capture = manager.capture_method
         manager.interaction = object()
 
-        with patch('ok.device.DeviceManager.require_platform'):
+        with (
+                patch('ok.device.DeviceManager.require_platform'),
+                patch(
+                    'ok.device.capture_methods.ScreenCaptureKitCaptureMethod',
+                    FakeCapture),
+        ):
             manager.do_start(notify=False)
 
         previous_capture.close.assert_called_once_with()
-        self.assertIsNone(manager.capture_method)
+        self.assertIsInstance(manager.capture_method, FakeCapture)
         self.assertIsNone(manager.interaction)
         self.assertTrue(manager.device_dict['macos']['target_bound'])
-        self.assertFalse(manager.device_dict['macos']['connected'])
-        self.assertEqual([], manager.available_capture_methods())
+        self.assertTrue(manager.device_dict['macos']['connected'])
+        self.assertEqual(['ScreenCaptureKit'], manager.available_capture_methods())
         self.assertEqual([], manager.available_interaction_methods())
-        self.assertFalse(manager.device_connected())
+        self.assertTrue(manager.device_connected())
+
+        manager.window_target.exists.return_value = False
+        manager.update_macos_device()
+        self.assertFalse(manager.device_dict['macos']['target_bound'])
+        self.assertFalse(manager.device_dict['macos']['connected'])
 
 
 class TestDeviceManagerPcWindows(unittest.TestCase):

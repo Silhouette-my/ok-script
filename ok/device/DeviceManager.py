@@ -152,6 +152,8 @@ class DeviceManager:
 
         if self.windows_capture_config is not None:
             default_capture = 'windows'
+        elif self.macos_window_config is not None:
+            default_capture = 'macos'
         elif self.browser_config is not None:
             default_capture = 'browser'
         elif self.adb_capture_config is not None:
@@ -265,6 +267,7 @@ class DeviceManager:
 
     def bind_macos_window(self, manual_window_id=None):
         """Bind an unambiguous or explicitly selected macOS window target."""
+        self._invalidate_macos_capture('macOS target selection started')
         selection = self.discover_macos_windows(manual_window_id)
         if selection.selected is None:
             self.window_target = None
@@ -288,6 +291,7 @@ class DeviceManager:
         self._require_macos_window_config()
         if self.window_target is None:
             return self.bind_macos_window()
+        self._invalidate_macos_capture('macOS target refresh started')
         try:
             return self.window_target.refresh()
         finally:
@@ -300,6 +304,17 @@ class DeviceManager:
     def request_macos_permission(self, kind):
         self._ensure_macos_window_services()
         return self.permission_service.request(kind)
+
+    def _invalidate_macos_capture(self, reason):
+        capture_method = getattr(self, 'capture_method', None)
+        invalidator = getattr(capture_method, 'invalidate', None)
+        if callable(invalidator):
+            invalidator(reason)
+
+    def macos_capture_diagnostics(self):
+        capture_method = getattr(self, 'capture_method', None)
+        diagnostics = getattr(capture_method, 'diagnostics', None)
+        return diagnostics() if callable(diagnostics) else None
 
     def refresh(self):
         logger.debug('calling refresh')
@@ -459,7 +474,7 @@ class DeviceManager:
             }
 
     def update_macos_device(self):
-        """Expose Stage C target state without claiming capture connectivity."""
+        """Expose target identity and the current Stage D capture state."""
         if self.macos_window_config is None:
             return
         target = self.window_target
@@ -470,15 +485,17 @@ class DeviceManager:
             candidate.application_name or candidate.title
             if candidate is not None else 'macOS Window'
         )
+        capture_diagnostics = self.macos_capture_diagnostics()
+        capture_state = getattr(capture_diagnostics, 'state', None)
+        capture_state_value = getattr(capture_state, 'value', None)
         self.device_dict['macos'] = {
             'address': '',
             'imei': 'macos',
             'device': 'macos',
             'nick': nick,
-            'capture': '',
-            # Stage D/E will provide capture/input.  A bound Stage C target is
-            # observable but must not be advertised as a connected device.
-            'connected': False,
+            'capture': 'ScreenCaptureKit',
+            'connected': target_bound and capture_state_value == 'running',
+            'capture_state': capture_state_value or 'unavailable',
             'target_bound': target_bound,
             'process_id': candidate.process_id if candidate is not None else 0,
             'window_id': candidate.window_id if candidate is not None else 0,
@@ -750,7 +767,7 @@ class DeviceManager:
         if kind == 'browser':
             return ['browser']
         if kind == 'macos':
-            return []
+            return ['ScreenCaptureKit']
         methods = ['adb']
         emulator = device.get('emulator')
         if emulator is not None:
@@ -882,15 +899,39 @@ class DeviceManager:
             preferred['connected'] = self.capture_method is not None and self.capture_method.connected()
         elif preferred['device'] == 'macos':
             require_platform('macOS desktop device', (MACOS,))
-            if self.capture_method is not None:
+            from ok.device.capture_methods import ScreenCaptureKitCaptureMethod
+            target_available = bool(
+                self.window_target is not None and self.window_target.exists())
+            if target_available:
+                self._ensure_macos_window_services()
+                if (
+                        not isinstance(
+                            self.capture_method, ScreenCaptureKitCaptureMethod)
+                        or self.capture_method.target is not self.window_target):
+                    if self.capture_method is not None:
+                        self.capture_method.close()
+                    self.capture_method = ScreenCaptureKitCaptureMethod(
+                        self.exit_event,
+                        self.window_target,
+                        self.permission_service,
+                    )
+            elif self.capture_method is not None:
                 self.capture_method.close()
                 self.capture_method = None
             self.interaction = None
             preferred['target_bound'] = bool(
                 self.window_target is not None and self.window_target.exists())
-            preferred['connected'] = False
+            preferred['connected'] = bool(
+                preferred['target_bound']
+                and self.capture_method is not None
+                and self.capture_method.connected())
+            capture_diagnostics = self.macos_capture_diagnostics()
+            capture_state = getattr(capture_diagnostics, 'state', None)
+            preferred['capture_state'] = (
+                getattr(capture_state, 'value', None) or 'unavailable')
             logger.info(
-                'macOS Stage C target is target-only; capture and input remain unavailable')
+                'macOS Stage D capture state: '
+                f'{capture_diagnostics}; input remains unavailable')
         elif preferred['device'] == 'browser':
             if not isinstance(self.capture_method, BrowserCaptureMethod):
                 if self.capture_method is not None:
@@ -1009,7 +1050,9 @@ class DeviceManager:
         if preferred['device'] == 'windows' or preferred['device'] == 'browser':
             return True
         if preferred['device'] == 'macos':
-            return False
+            return bool(
+                self.capture_method is not None
+                and self.capture_method.connected())
         elif self.device is not None:
             try:
                 state = self.shell('echo 1', timeout=3)

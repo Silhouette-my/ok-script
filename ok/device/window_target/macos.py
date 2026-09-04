@@ -1,7 +1,7 @@
 """Public-API macOS window discovery and foreground observation.
 
 ScreenCaptureKit is used here only for low-frequency discovery/rebinding.  The
-persistent ``SCStream`` capture implementation belongs to the next stage.
+persistent ``SCStream`` implementation remains isolated in the capture layer.
 """
 
 from __future__ import annotations
@@ -150,7 +150,7 @@ class PyObjCMacOSWindowSystem:
                     WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
                 ),
                 # Discovery metadata cannot establish content/capture pixels.
-                # Stage D fills these from actual SCStream frames.
+                # The capture layer derives them from actual SCStream frames.
                 content_geometry=None,
                 capture_geometry=None,
                 display_scale=None,

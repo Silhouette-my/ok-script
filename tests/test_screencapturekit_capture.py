@@ -1,0 +1,560 @@
+from types import SimpleNamespace
+import sys
+import threading
+
+import numpy as np
+import pytest
+
+from ok.device.capture_methods.screencapturekit import (
+    CaptureStreamState,
+    PyObjCScreenCaptureKitBackend,
+    ScreenCaptureKitCaptureMethod,
+    ScreenCaptureKitCaptureError,
+    _with_locked_bgra_pixel_buffer,
+)
+from ok.device.capture_methods.screencapturekit_core import StreamFrameMetadata
+from ok.device.services import PermissionKind, PermissionState, PermissionStatus
+from ok.device.window_target import (
+    WindowCandidate,
+    WindowCoordinateSpace,
+    WindowGeometry,
+    WindowTargetSnapshot,
+)
+from ok.task.exceptions import CaptureException
+
+
+MAC_POINTS = WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS
+
+
+def candidate(*, width=12, content_geometry=None):
+    return WindowCandidate(
+        process_id=10,
+        window_id=20,
+        bundle_identifier='com.example.game',
+        application_name='Example Game',
+        title='Game',
+        layer=0,
+        outer_geometry=WindowGeometry(100, 200, width, 12, MAC_POINTS),
+        content_geometry=content_geometry,
+    )
+
+
+class FakeTarget:
+    def __init__(self):
+        self.snapshot = WindowTargetSnapshot(candidate(), 1, True)
+        self.alive = True
+
+    def exists(self):
+        return self.alive
+
+
+class FakePermissionService:
+    def __init__(self, state=PermissionState.GRANTED):
+        self.state = state
+        self.calls = 0
+
+    def status(self, kind):
+        assert kind is PermissionKind.SCREEN_RECORDING
+        self.calls += 1
+        return PermissionStatus(
+            kind,
+            self.state,
+            self.state is not PermissionState.GRANTED,
+            'System Settings > Privacy & Security > Screen Recording',
+        )
+
+
+class FakeBackend:
+    def __init__(self):
+        self.starts = []
+        self.stops = []
+        self.callbacks = []
+        self.fail_start = None
+
+    def start_stream(
+            self,
+            target_snapshot,
+            on_sample,
+            on_stopped,
+            on_sample_error,
+            *,
+            frames_per_second,
+            timeout):
+        if self.fail_start:
+            raise RuntimeError(self.fail_start)
+        binding = SimpleNamespace(number=len(self.starts) + 1)
+        self.starts.append((binding, target_snapshot, frames_per_second, timeout))
+        self.callbacks.append((on_sample, on_stopped, on_sample_error))
+        return binding
+
+    def stop_stream(self, binding, *, timeout):
+        self.stops.append((binding, timeout))
+
+    def publish(self, data, *, metadata=None, index=-1, width=12, height=12, stride=48):
+        on_sample = self.callbacks[index][0]
+        on_sample(
+            data,
+            width,
+            height,
+            stride,
+            metadata or StreamFrameMetadata(
+                True,
+                content_rect_points=WindowGeometry(0, 0, width, height),
+                display_scale=1.0,
+            ),
+        )
+
+
+def make_capture(*, permission=None, target=None, backend=None, monotonic=None):
+    return ScreenCaptureKitCaptureMethod(
+        threading.Event(),
+        target or FakeTarget(),
+        permission or FakePermissionService(),
+        backend=backend or FakeBackend(),
+        lifecycle_timeout=0.1,
+        monotonic=monotonic or (lambda: 10.0),
+    )
+
+
+def sample(value=1):
+    return bytearray([value, value + 1, value + 2, 255] * 144)
+
+
+def test_stream_is_started_once_and_publishes_latest_owned_bgr_frame():
+    backend = FakeBackend()
+    capture = make_capture(backend=backend)
+    assert len(backend.starts) == 1
+
+    source = sample(1)
+    backend.publish(source)
+    frame = capture.get_frame()
+    source[:3] = b'\xff\xff\xff'
+
+    assert len(backend.starts) == 1
+    assert frame.shape == (12, 12, 3)
+    assert frame.dtype == np.uint8
+    assert frame[0, 0].tolist() == [1, 2, 3]
+    assert capture.connected()
+    packet = capture.get_frame_packet()
+    assert packet.frame is frame
+    assert packet.geometry.target_generation == 1
+
+
+def test_only_complete_frames_are_published_and_storage_stays_one_slot():
+    backend = FakeBackend()
+    capture = make_capture(backend=backend)
+    backend.publish(sample(1), metadata=StreamFrameMetadata(False))
+    assert capture.get_frame() is None
+
+    backend.publish(sample(2))
+    backend.publish(sample(3))
+    assert capture.get_frame()[0, 0].tolist() == [3, 4, 5]
+    diagnostics = capture.diagnostics()
+    assert diagnostics.frames_received == 3
+    assert diagnostics.frames_dropped_incomplete == 1
+    assert diagnostics.frames_published == 2
+    assert diagnostics.frames_overwritten == 1
+    assert diagnostics.storage_size == 1
+
+
+def test_content_rect_crops_title_bar_or_surface_padding_and_tracks_geometry():
+    target = FakeTarget()
+    target.snapshot = WindowTargetSnapshot(
+        candidate(
+            width=11,
+            content_geometry=WindowGeometry(110, 230, 11, 11, MAC_POINTS),
+        ),
+        1,
+        True,
+    )
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    raw = bytearray([1, 2, 3, 255] * 144)
+    metadata = StreamFrameMetadata(
+        True,
+        content_rect_points=WindowGeometry(1, 1, 11, 11),
+        display_scale=1.0,
+        content_scale=1.0,
+    )
+    backend.publish(raw, metadata=metadata)
+
+    assert capture.get_frame().shape == (11, 11, 3)
+    assert capture.geometry.content_rect_pixels.x == 1
+    assert capture.frame_pixel_to_global_point(5.5, 5.5) == (115.5, 235.5)
+
+
+def test_target_generation_change_invalidates_old_frame_and_rebuilds_once():
+    target = FakeTarget()
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    old_callback = backend.callbacks[0][0]
+    backend.publish(sample(1))
+    assert capture.get_frame() is not None
+
+    target.snapshot = WindowTargetSnapshot(candidate(width=5), 2, True)
+    assert capture.get_frame() is None
+    assert len(backend.starts) == 2
+    assert len(backend.stops) == 1
+
+    old_callback(
+        sample(2), 12, 12, 48,
+        StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 12, 12),
+            display_scale=1.0,
+        ),
+    )
+    assert capture.get_frame() is None
+    diagnostics = capture.diagnostics()
+    assert diagnostics.frames_dropped_stale == 1
+    assert diagnostics.rebuilds == 1
+
+
+def test_scale_or_stream_geometry_change_discards_frame_and_rebuilds():
+    backend = FakeBackend()
+    capture = make_capture(backend=backend)
+    backend.publish(sample(1))
+    assert capture.get_frame() is not None
+
+    backend.publish(
+        sample(2),
+        metadata=StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 6, 6),
+            display_scale=2.0,
+        ),
+    )
+
+    assert capture.get_frame() is None
+    assert len(backend.starts) == 2
+    assert len(backend.stops) == 1
+    diagnostics = capture.diagnostics()
+    assert diagnostics.geometry_invalidations == 1
+    assert diagnostics.rebuilds == 1
+
+
+def test_stop_failure_is_fatal_and_does_not_start_a_second_stream():
+    class FailingStopBackend(FakeBackend):
+        def stop_stream(self, binding, *, timeout):
+            self.stops.append((binding, timeout))
+            raise RuntimeError('stop timed out')
+
+    backend = FailingStopBackend()
+    capture = make_capture(backend=backend)
+    backend.publish(sample(1))
+    backend.publish(
+        sample(2),
+        metadata=StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 6, 6),
+            display_scale=2.0,
+        ),
+    )
+
+    with pytest.raises(CaptureException, match='stop failed'):
+        capture.get_frame()
+
+    diagnostics = capture.diagnostics()
+    assert len(backend.starts) == 1
+    assert len(backend.stops) == 1
+    assert diagnostics.state is CaptureStreamState.FATAL
+    assert diagnostics.storage_size == 0
+    assert diagnostics.geometry is None
+
+    capture.close()
+    assert len(backend.stops) == 2
+    assert capture.diagnostics().state is CaptureStreamState.CLOSED
+
+
+def test_unexpected_stop_racing_target_rebuild_remains_fatal():
+    target = FakeTarget()
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    target.snapshot = WindowTargetSnapshot(candidate(width=5), 2, True)
+    original_detach = capture._detach_stream
+
+    def stop_before_detach():
+        backend.callbacks[0][1]('stopped during target rebuild')
+        return original_detach()
+
+    capture._detach_stream = stop_before_detach
+
+    with pytest.raises(CaptureException, match='stopped during target rebuild'):
+        capture.get_frame()
+
+    assert len(backend.starts) == 1
+    assert capture.diagnostics().state is CaptureStreamState.FATAL
+
+
+def test_explicit_invalidation_rejects_callback_before_target_refresh_finishes():
+    backend = FakeBackend()
+    capture = make_capture(backend=backend)
+    callback = backend.callbacks[0][0]
+    capture.invalidate('refresh started')
+    callback(
+        sample(1), 12, 12, 48,
+        StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 12, 12),
+            display_scale=1.0,
+        ),
+    )
+
+    assert capture.diagnostics().frames_dropped_stale == 1
+    assert capture.get_frame() is None
+
+
+@pytest.mark.parametrize(
+    ('state', 'expected_state'),
+    [
+        (PermissionState.REQUIRED, CaptureStreamState.PERMISSION_REQUIRED),
+        (PermissionState.REVOKED, CaptureStreamState.PERMISSION_REVOKED),
+    ],
+)
+def test_missing_or_revoked_permission_is_explicit_and_does_not_retry(state, expected_state):
+    permission = FakePermissionService(state)
+    backend = FakeBackend()
+    capture = make_capture(permission=permission, backend=backend)
+
+    with pytest.raises(CaptureException, match='permission'):
+        capture.get_frame()
+    with pytest.raises(CaptureException, match='permission'):
+        capture.get_frame()
+
+    assert backend.starts == []
+    assert capture.diagnostics().state is expected_state
+
+
+def test_permission_revocation_after_start_stops_stream_and_clears_frame():
+    permission = FakePermissionService()
+    backend = FakeBackend()
+    capture = make_capture(permission=permission, backend=backend)
+    backend.publish(sample(1))
+    assert capture.get_frame() is not None
+
+    permission.state = PermissionState.REVOKED
+    assert not capture.connected()
+    with pytest.raises(CaptureException, match='permission'):
+        capture.get_frame()
+
+    assert len(backend.stops) == 1
+    assert capture.diagnostics().storage_size == 0
+
+
+def test_target_loss_stops_stream_without_returning_stale_frame():
+    target = FakeTarget()
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    backend.publish(sample(1))
+    target.snapshot = WindowTargetSnapshot(None, 2, False)
+
+    assert not capture.connected()
+    assert capture.get_frame() is None
+    assert len(backend.stops) == 1
+    assert capture.diagnostics().state is CaptureStreamState.TARGET_UNAVAILABLE
+
+
+def test_live_target_check_rejects_stale_snapshot_and_stops_stream():
+    target = FakeTarget()
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    backend.publish(sample(1))
+    target.alive = False
+
+    assert capture.get_frame() is None
+    assert not capture.connected()
+    assert len(backend.stops) == 1
+    assert capture.diagnostics().state is CaptureStreamState.TARGET_UNAVAILABLE
+    assert capture.diagnostics().storage_size == 0
+
+
+def test_fatal_start_and_runtime_stop_do_not_tight_retry_same_generation():
+    failed_backend = FakeBackend()
+    failed_backend.fail_start = 'start denied'
+    failed = make_capture(backend=failed_backend)
+    with pytest.raises(CaptureException, match='start denied'):
+        failed.get_frame()
+    with pytest.raises(CaptureException, match='start denied'):
+        failed.get_frame()
+    assert len(failed_backend.starts) == 0
+
+    backend = FakeBackend()
+    capture = make_capture(backend=backend)
+    backend.callbacks[0][1]('stream stopped')
+    with pytest.raises(CaptureException, match='stream stopped'):
+        capture.get_frame()
+    assert len(backend.starts) == 1
+    assert not capture.connected()
+
+
+def test_start_failure_after_a_callback_clears_frame_and_geometry():
+    class CallbackThenFail(FakeBackend):
+        def start_stream(
+                self,
+                target_snapshot,
+                on_sample,
+                on_stopped,
+                on_sample_error,
+                *,
+                frames_per_second,
+                timeout):
+            on_sample(
+                sample(1),
+                12,
+                12,
+                48,
+                StreamFrameMetadata(
+                    True,
+                    content_rect_points=WindowGeometry(0, 0, 12, 12),
+                    display_scale=1.0,
+                ),
+            )
+            raise RuntimeError('start failed after callback')
+
+    capture = make_capture(backend=CallbackThenFail())
+    diagnostics = capture.diagnostics()
+
+    assert diagnostics.state is CaptureStreamState.FATAL
+    assert diagnostics.storage_size == 0
+    assert diagnostics.geometry is None
+    assert capture._size == (0, 0)
+
+
+def test_stop_callback_racing_stream_start_cannot_restore_running_state():
+    class StopsDuringStart(FakeBackend):
+        def start_stream(self, *args, **kwargs):
+            binding = super().start_stream(*args, **kwargs)
+            self.callbacks[-1][1]('stopped during start')
+            return binding
+
+    backend = StopsDuringStart()
+    capture = make_capture(backend=backend)
+
+    assert capture.diagnostics().state is CaptureStreamState.FATAL
+    assert len(backend.stops) == 1
+    assert not capture.connected()
+
+
+def test_diagnostics_report_fps_age_conversion_errors_and_generations():
+    clock = iter((1.0, 2.0, 3.0, 5.0))
+    backend = FakeBackend()
+    capture = make_capture(backend=backend, monotonic=lambda: next(clock))
+    backend.publish(sample(1))
+    backend.publish(sample(2))
+    backend.callbacks[0][2]('bad surface')
+    diagnostics = capture.diagnostics()
+
+    assert diagnostics.fps == 1.0
+    assert diagnostics.frame_age_seconds == 1.0
+    assert diagnostics.frame_conversion_errors == 1
+    assert diagnostics.target_generation == 1
+    assert diagnostics.capture_generation > 0
+    assert diagnostics.geometry.target_generation == 1
+    assert capture.get_frame() is None
+
+
+def test_close_is_idempotent_and_rejects_late_callbacks():
+    backend = FakeBackend()
+    capture = make_capture(backend=backend)
+    callback = backend.callbacks[0][0]
+    capture.close()
+    capture.close()
+    callback(
+        sample(1), 12, 12, 48,
+        StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 12, 12),
+            display_scale=1.0,
+        ),
+    )
+
+    assert len(backend.stops) == 1
+    assert capture.diagnostics().state is CaptureStreamState.CLOSED
+    assert capture.get_frame() is None
+
+
+def test_display_scale_uses_pixels_over_points_for_selected_display():
+    backend = object.__new__(PyObjCScreenCaptureKitBackend)
+    display = SimpleNamespace(
+        frame=lambda: ((0, 0), (100, 80)),
+        width=lambda: 150,
+        height=lambda: 120,
+    )
+    content = SimpleNamespace(displays=lambda: (display,))
+    window = SimpleNamespace(frame=lambda: ((10, 10), (50, 40)))
+
+    assert backend._display_scale(content, window) == 1.5
+    with pytest.raises(ScreenCaptureKitCaptureError, match='display containing'):
+        backend._display_scale(
+            SimpleNamespace(displays=lambda: (display,)),
+            SimpleNamespace(frame=lambda: ((200, 200), (10, 10))),
+        )
+
+
+def test_pixel_buffer_contract_unlocks_after_consumer_error_and_rejects_non_bgra():
+    class BaseAddress:
+        def as_buffer(self, length):
+            assert length == 48
+            return memoryview(bytearray(length))
+
+    class FakeQuartz:
+        kCVPixelFormatType_32BGRA = 1
+        kCVPixelBufferLock_ReadOnly = 2
+        pixel_format = 1
+        calls = []
+
+        @classmethod
+        def CVPixelBufferIsPlanar(cls, _buffer):
+            return False
+
+        @classmethod
+        def CVPixelBufferGetPixelFormatType(cls, _buffer):
+            return cls.pixel_format
+
+        @classmethod
+        def CVPixelBufferLockBaseAddress(cls, _buffer, flags):
+            cls.calls.append(('lock', flags))
+            return 0
+
+        @classmethod
+        def CVPixelBufferUnlockBaseAddress(cls, _buffer, flags):
+            cls.calls.append(('unlock', flags))
+
+        @staticmethod
+        def CVPixelBufferGetWidth(_buffer):
+            return 4
+
+        @staticmethod
+        def CVPixelBufferGetHeight(_buffer):
+            return 3
+
+        @staticmethod
+        def CVPixelBufferGetBytesPerRow(_buffer):
+            return 16
+
+        @staticmethod
+        def CVPixelBufferGetBaseAddress(_buffer):
+            return BaseAddress()
+
+    def fail_consumer(*_args):
+        raise RuntimeError('consumer failed')
+
+    with pytest.raises(RuntimeError, match='consumer failed'):
+        _with_locked_bgra_pixel_buffer(FakeQuartz, object(), fail_consumer)
+    assert FakeQuartz.calls == [('lock', 2), ('unlock', 2)]
+
+    FakeQuartz.pixel_format = 9
+    with pytest.raises(ScreenCaptureKitCaptureError, match='expected BGRA'):
+        _with_locked_bgra_pixel_buffer(FakeQuartz, object(), fail_consumer)
+    assert FakeQuartz.calls == [('lock', 2), ('unlock', 2)]
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='PyObjC adapter check')
+def test_pyobjc_callback_classes_are_protocol_backed_and_reusable():
+    first = PyObjCScreenCaptureKitBackend()
+    second = PyObjCScreenCaptureKitBackend()
+
+    assert first._output_class is second._output_class
+    assert first._delegate_class is second._delegate_class
+    assert hasattr(first._output_class, 'stream_didOutputSampleBuffer_ofType_')
+    assert hasattr(first._delegate_class, 'stream_didStopWithError_')
