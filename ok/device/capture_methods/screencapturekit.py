@@ -26,7 +26,7 @@ from ok.device.window_target.base import (
     WindowGeometry,
     WindowTargetSnapshot,
 )
-from ok.platform import MACOS, require_platform
+from ok.platform import require_macos_foreground_host
 from ok.util.logger import Logger
 
 
@@ -210,7 +210,7 @@ class PyObjCScreenCaptureKitBackend:
     """Thin public-API PyObjC adapter; imported only on Darwin."""
 
     def __init__(self):
-        require_platform("ScreenCaptureKit capture", (MACOS,))
+        require_macos_foreground_host("ScreenCaptureKit capture")
         import AppKit
         import ApplicationServices
         import CoreMedia

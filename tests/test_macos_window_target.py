@@ -20,7 +20,9 @@ from ok.device.window_target.macos import (
 )
 
 
-def candidate(pid, window_id, *, width=1280, title="Game", frontmost=False):
+def candidate(
+        pid, window_id, *, x=0, y=0, width=1280, height=720,
+        title="Game", frontmost=False):
     return WindowCandidate(
         process_id=pid,
         window_id=window_id,
@@ -28,7 +30,7 @@ def candidate(pid, window_id, *, width=1280, title="Game", frontmost=False):
         application_name="Example Game",
         title=title,
         layer=0,
-        outer_geometry=WindowGeometry(0, 0, width, 720),
+        outer_geometry=WindowGeometry(x, y, width, height),
         frontmost=frontmost,
     )
 
@@ -57,6 +59,13 @@ class FakeMacOSSystem:
             item.runtime_identity == (process_id, window_id)
             for item in self.windows
         )
+
+    def window_geometry(self, process_id, window_id):
+        item = next((
+            item for item in self.windows
+            if item.runtime_identity == (process_id, window_id)
+        ), None)
+        return item.outer_geometry if item is not None else None
 
     def request_activation(self, process_id):
         self.activation_requests.append(process_id)
@@ -167,10 +176,10 @@ def test_exists_invalidates_target_when_liveness_check_raises():
     class FailingLivenessSystem(FakeMacOSSystem):
         fail = False
 
-        def window_exists(self, process_id, window_id):
+        def window_geometry(self, process_id, window_id):
             if self.fail:
                 raise RuntimeError('Quartz unavailable')
-            return super().window_exists(process_id, window_id)
+            return super().window_geometry(process_id, window_id)
 
     first = candidate(10, 20)
     system = FailingLivenessSystem([first])
@@ -186,6 +195,21 @@ def test_exists_invalidates_target_when_liveness_check_raises():
 
     assert target.snapshot.candidate is None
     assert target.generation == 2
+
+
+def test_exists_invalidates_generation_on_same_size_live_window_move():
+    first = candidate(10, 20, x=10, y=20)
+    system = FakeMacOSSystem([first])
+    target = MacOSWindowDiscovery(system).bind(
+        first,
+        WindowMatchHints(bundle_identifiers=('com.example.game',)),
+    )
+    system.windows = (candidate(10, 20, x=210, y=120),)
+
+    assert target.exists()
+    assert target.generation == 2
+    assert target.outer_geometry == WindowGeometry(210, 120, 1280, 720)
+    assert system.enumerations == 1
 
 
 def test_target_is_fail_closed_while_refresh_enumeration_is_blocked():
@@ -347,6 +371,7 @@ def test_pyobjc_window_exists_checks_window_id_and_owner_pid():
         kCGWindowListOptionIncludingWindow = 'including-window'
         kCGWindowNumber = 'window-number'
         kCGWindowOwnerPID = 'owner-pid'
+        kCGWindowBounds = 'bounds'
         result = []
 
         @classmethod
@@ -357,10 +382,18 @@ def test_pyobjc_window_exists_checks_window_id_and_owner_pid():
 
     system = object.__new__(PyObjCMacOSWindowSystem)
     system._quartz = FakeQuartz
-    FakeQuartz.result = [{'window-number': 7, 'owner-pid': 42}]
+    FakeQuartz.result = [{
+        'window-number': 7,
+        'owner-pid': 42,
+        'bounds': {'X': 10, 'Y': 20, 'Width': 1280, 'Height': 720},
+    }]
 
     assert system.window_exists(42, 7)
     assert not system.window_exists(43, 7)
+    assert system.window_geometry(42, 7) == WindowGeometry(
+        10, 20, 1280, 720,
+        WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
+    )
 
 
 def test_discovery_manual_selection_returns_stable_hint_only():

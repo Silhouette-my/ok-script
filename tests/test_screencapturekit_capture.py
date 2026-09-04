@@ -21,8 +21,10 @@ from ok.device.window_target import (
     WindowCandidate,
     WindowCoordinateSpace,
     WindowGeometry,
+    WindowMatchHints,
     WindowTargetSnapshot,
 )
+from ok.device.window_target.macos import MacOSWindowDiscovery
 from ok.task.exceptions import CaptureException
 
 
@@ -190,7 +192,7 @@ def test_content_region_fails_closed_without_verifiable_title_bar():
         backend._content_region(selected, selected_window)
 
 
-def candidate(*, width=12, content_geometry=None):
+def candidate(*, x=100, y=200, width=12, height=12, content_geometry=None):
     return WindowCandidate(
         process_id=10,
         window_id=20,
@@ -198,7 +200,7 @@ def candidate(*, width=12, content_geometry=None):
         application_name='Example Game',
         title='Game',
         layer=0,
-        outer_geometry=WindowGeometry(100, 200, width, 12, MAC_POINTS),
+        outer_geometry=WindowGeometry(x, y, width, height, MAC_POINTS),
         content_geometry=content_geometry,
     )
 
@@ -420,6 +422,82 @@ def test_target_generation_change_invalidates_old_frame_and_rebuilds_once():
     diagnostics = capture.diagnostics()
     assert diagnostics.frames_dropped_stale == 1
     assert diagnostics.rebuilds == 1
+
+
+def test_live_same_size_move_without_screen_rect_rejects_old_frame_and_rebinds_once():
+    initial_content = WindowGeometry(100, 202, 12, 10, MAC_POINTS)
+    moved_content = WindowGeometry(140, 242, 12, 10, MAC_POINTS)
+    initial = candidate(content_geometry=initial_content)
+
+    class LiveGeometrySystem:
+        windows = (initial,)
+
+        def enumerate_windows(self, _timeout):
+            return self.windows
+
+        def process_exists(self, process_id):
+            return process_id == 10
+
+        def window_exists(self, process_id, window_id):
+            return any(
+                item.runtime_identity == (process_id, window_id)
+                for item in self.windows)
+
+        def window_geometry(self, process_id, window_id):
+            selected = next((
+                item for item in self.windows
+                if item.runtime_identity == (process_id, window_id)
+            ), None)
+            return selected.outer_geometry if selected is not None else None
+
+        def frontmost_process_id(self):
+            return 10
+
+        def request_activation(self, _process_id):
+            return True
+
+    system = LiveGeometrySystem()
+    discovery = MacOSWindowDiscovery(system)
+    hints = WindowMatchHints(bundle_identifiers=("com.example.game",))
+    target = discovery.bind(initial, hints)
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    old_callback = backend.callbacks[0][0]
+    initial_metadata = StreamFrameMetadata(
+        True,
+        content_rect_points=WindowGeometry(0, 0, 12, 10),
+        display_scale=1.0,
+        global_content_geometry=initial_content,
+    )
+    backend.publish(sample(1), metadata=initial_metadata)
+    assert capture.get_frame_packet() is not None
+
+    system.windows = (
+        candidate(x=140, y=240, content_geometry=moved_content),)
+    assert capture.get_frame_packet() is None
+    assert len(backend.starts) == 2
+    assert len(backend.stops) == 1
+
+    old_callback(sample(2), 12, 12, 48, initial_metadata)
+    assert capture.get_frame_packet() is None
+    assert len(backend.starts) == 2
+
+    backend.publish(
+        sample(3),
+        metadata=StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 12, 10),
+            display_scale=1.0,
+            global_content_geometry=moved_content,
+        ),
+    )
+    packet = capture.get_frame_packet()
+    assert packet is not None
+    assert packet.geometry.outer_geometry == WindowGeometry(
+        140, 240, 12, 12, MAC_POINTS)
+    assert packet.geometry.global_content_geometry == moved_content
+    assert packet.geometry.frame_pixel_to_global_point(6, 5) == (146, 247)
+    assert capture.diagnostics().rebuilds == 1
 
 
 def test_scale_or_stream_geometry_change_discards_frame_and_rebuilds():

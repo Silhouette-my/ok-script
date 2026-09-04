@@ -5,8 +5,12 @@ import pytest
 
 from ok.device.interaction_methods.foreground_safety import ForegroundInputError
 from ok.device.interaction_methods.macos_keys import macos_key_code
-from ok.device.interaction_methods.quartz import QuartzForegroundInteraction
+from ok.device.interaction_methods.quartz import (
+    PyObjCQuartzEventSink,
+    QuartzForegroundInteraction,
+)
 from ok.device.services import PermissionKind
+from ok.task.TaskExecutor import TaskExecutor
 from ok.util.handler import ExitEvent
 
 
@@ -40,16 +44,21 @@ class FakeTarget:
         self.present = True
         self.frontmost = True
         self.activation_requested = 0
+        self.activation_observed = True
+        self.on_foreground_check = None
         self.snapshot = SimpleNamespace(
             exists=True,
             generation=4,
-            candidate=SimpleNamespace(process_id=123),
+            candidate=SimpleNamespace(process_id=123, window_id=456),
         )
 
     def exists(self):
         return self.present
 
     def is_foreground(self):
+        if self.on_foreground_check is not None:
+            callback, self.on_foreground_check = self.on_foreground_check, None
+            callback()
         return self.frontmost
 
     def request_activation(self):
@@ -57,8 +66,8 @@ class FakeTarget:
         return True
 
     def wait_for_observed_activation(self, _timeout):
-        self.frontmost = True
-        return True
+        self.frontmost = self.activation_observed
+        return self.activation_observed
 
 
 class FakePermissionService:
@@ -266,6 +275,65 @@ def test_generation_change_and_permission_revoke_fail_closed(interaction):
     assert permission_error.value.code == "MAC_ACCESSIBILITY_PERMISSION_REQUIRED"
 
 
+def test_live_generation_change_during_frontmost_check_blocks_post(interaction):
+    interaction.target.on_foreground_check = lambda: setattr(
+        interaction.target.snapshot, "generation", 5)
+
+    with pytest.raises(ForegroundInputError, match="generation changed"):
+        interaction.send_key_down("w")
+
+    assert not [event for event in interaction.event_sink.events if event[0] == "key"]
+
+
+def test_invalid_runtime_window_identity_blocks_post(interaction):
+    interaction.target.snapshot.candidate.window_id = 0
+
+    with pytest.raises(ForegroundInputError, match="target is unavailable"):
+        interaction.send_key_down("w")
+
+    assert not [event for event in interaction.event_sink.events if event[0] == "key"]
+
+
+@pytest.mark.parametrize("failure", ["target", "capture", "permission"])
+def test_target_capture_and_permission_failure_release_all_without_new_down(failure):
+    value = QuartzForegroundInteraction(
+        FakeCapture(),
+        FakeTarget(),
+        FakePermissionService(),
+        event_sink=FakeSink(),
+        monitor_interval=10,
+        sleep=lambda _seconds: None,
+    )
+    value.on_run()
+    try:
+        value.send_key_down("w")
+        value.mouse_down(key="right")
+        before_failure = len(value.event_sink.events)
+        if failure == "target":
+            value.target.present = False
+        elif failure == "capture":
+            value.capture.state = "fatal"
+            value.capture.last_error = "stream stopped"
+        else:
+            value.permission_service.revoked_kind = PermissionKind.ACCESSIBILITY
+
+        with pytest.raises(ForegroundInputError):
+            value.move(1, 1)
+
+        tail = value.event_sink.events[before_failure:]
+        assert ("key", macos_key_code("w"), False) in tail
+        assert any(event[:3] == ("button", "right", False) for event in tail)
+        assert not any(
+            event == ("key", macos_key_code("w"), True)
+            or event[:3] == ("button", "right", True)
+            for event in tail
+        )
+        assert value.held_state.snapshot().keys == ()
+        assert value.held_state.snapshot().buttons == ()
+    finally:
+        value.on_destroy()
+
+
 def test_release_all_continues_after_one_failure_and_always_clears(interaction):
     w = macos_key_code("w")
     interaction.send_key_down("w")
@@ -354,6 +422,89 @@ def test_on_run_requests_activation_once_and_observes_frontmost():
         assert value.guard.is_open
     finally:
         value.on_destroy()
+
+
+def test_activation_request_without_observed_frontmost_keeps_gate_closed():
+    target = FakeTarget()
+    target.frontmost = False
+    target.activation_observed = False
+    value = QuartzForegroundInteraction(
+        FakeCapture(), target, FakePermissionService(), event_sink=FakeSink())
+
+    with pytest.raises(ForegroundInputError, match="did not become frontmost"):
+        value.on_run()
+
+    assert target.activation_requested == 1
+    assert not value.guard.is_open
+    assert value.event_sink.events == []
+    value.on_destroy()
+
+
+def test_production_sink_rechecks_immediately_before_ordinary_post():
+    class FakeQuartz:
+        kCGHIDEventTap = "hid"
+        posts = []
+
+        @staticmethod
+        def CGEventCreateKeyboardEvent(_source, key_code, is_down):
+            return ("key", key_code, is_down)
+
+        @classmethod
+        def CGEventPost(cls, tap, event):
+            cls.posts.append((tap, event))
+
+    checks = []
+
+    def reject():
+        checks.append("checked")
+        raise ForegroundInputError("MAC_GAME_NOT_FOREGROUND", "focus changed")
+
+    sink = PyObjCQuartzEventSink(reject, quartz=FakeQuartz)
+    with pytest.raises(ForegroundInputError, match="focus changed"):
+        sink.key_event(macos_key_code("w"), True)
+    assert checks == ["checked"]
+    assert FakeQuartz.posts == []
+
+    # Matching releases intentionally bypass the ordinary-event gate.
+    sink.key_event(macos_key_code("w"), False)
+    assert FakeQuartz.posts == [
+        ("hid", ("key", macos_key_code("w"), False)),
+    ]
+
+
+def test_task_executor_stop_releases_held_input_and_prevents_reopen():
+    exit_event = ExitEvent()
+    value = QuartzForegroundInteraction(
+        FakeCapture(),
+        FakeTarget(),
+        FakePermissionService(),
+        event_sink=FakeSink(),
+        exit_event=exit_event,
+        monitor_interval=10,
+    )
+    value.on_run()
+    value.send_key_down("w")
+    value.mouse_down(key="middle")
+    executor = TaskExecutor.__new__(TaskExecutor)
+    executor.device_manager = SimpleNamespace(interaction=value)
+    executor.exit_event = exit_event
+    executor._wake_executor = lambda: None
+
+    executor.stop()
+
+    assert value.held_state.snapshot().keys == ()
+    assert value.held_state.snapshot().buttons == ()
+    assert exit_event.is_set()
+    with pytest.raises(ForegroundInputError, match="stopping"):
+        value.on_run()
+    value.on_destroy()
+
+
+def test_global_cursor_position_rejects_non_finite_values(interaction):
+    with pytest.raises(ValueError, match="finite"):
+        interaction.set_cursor_position((float("nan"), 10))
+    with pytest.raises(ValueError, match="finite"):
+        interaction.set_cursor_position((10, float("inf")))
 
 
 @pytest.mark.parametrize("key", ["w", "a", "s", "d", "e", "q", "r", "f", "t",

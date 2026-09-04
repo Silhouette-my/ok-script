@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Callable, Protocol
@@ -14,7 +15,7 @@ from ok.device.interaction_methods.foreground_safety import (
     HeldInputState,
 )
 from ok.device.interaction_methods.macos_keys import macos_key_code
-from ok.platform import MACOS, require_platform
+from ok.platform import require_macos_foreground_host
 from ok.util.logger import Logger
 
 
@@ -33,18 +34,29 @@ class QuartzEventSink(Protocol):
 class PyObjCQuartzEventSink:
     """Small lazy PyObjC adapter; tests inject a deterministic fake sink."""
 
-    def __init__(self):
-        require_platform("Quartz foreground interaction", (MACOS,))
-        import Quartz  # type: ignore[import-untyped]
-        self.quartz = Quartz
+    def __init__(self, pre_post_check: Callable[[], None], *, quartz=None):
+        self._pre_post_check = pre_post_check
+        if quartz is None:
+            require_macos_foreground_host("Quartz foreground interaction")
+            import Quartz  # type: ignore[import-untyped]
+            quartz = Quartz
+        self.quartz = quartz
 
-    def _post(self, event) -> None:
+    def _post(self, event, *, ordinary: bool) -> None:
         if event is None:
             raise RuntimeError("Quartz failed to create a CGEvent")
+        if ordinary:
+            # Keep the final production check adjacent to the global post.
+            # Matching release events bypass it so fail-closed cleanup can
+            # still clear synthetic held state after focus is lost.
+            self._pre_post_check()
         self.quartz.CGEventPost(self.quartz.kCGHIDEventTap, event)
 
     def key_event(self, key_code: int, is_down: bool) -> None:
-        self._post(self.quartz.CGEventCreateKeyboardEvent(None, key_code, is_down))
+        self._post(
+            self.quartz.CGEventCreateKeyboardEvent(None, key_code, is_down),
+            ordinary=is_down,
+        )
 
     def cursor_position(self) -> tuple[float, float]:
         event = self.quartz.CGEventCreate(None)
@@ -85,7 +97,7 @@ class PyObjCQuartzEventSink:
             if button is None else self._mouse_button_code(button))
         event = self.quartz.CGEventCreateMouseEvent(
             None, self._mouse_event_type(button), position, button_code)
-        self._post(event)
+        self._post(event, ordinary=True)
 
     def mouse_button(self, button: str, is_down: bool, position: tuple[float, float]) -> None:
         event = self.quartz.CGEventCreateMouseEvent(
@@ -94,12 +106,12 @@ class PyObjCQuartzEventSink:
             position,
             self._mouse_button_code(button),
         )
-        self._post(event)
+        self._post(event, ordinary=is_down)
 
     def scroll(self, amount: int) -> None:
         event = self.quartz.CGEventCreateScrollWheelEvent(
             None, self.quartz.kCGScrollEventUnitLine, 1, int(amount))
-        self._post(event)
+        self._post(event, ordinary=True)
 
 
 class QuartzForegroundCursorService:
@@ -153,7 +165,6 @@ class QuartzForegroundInteraction(BaseInteraction):
             raise ValueError("activation timeout and monitor interval must be positive")
         self.target = target
         self.permission_service = permission_service
-        self.event_sink = event_sink or PyObjCQuartzEventSink()
         self.activation_timeout = activation_timeout
         self.monitor_interval = monitor_interval
         self.exit_event = exit_event
@@ -167,6 +178,7 @@ class QuartzForegroundInteraction(BaseInteraction):
             lock=self._input_lock,
             stop_requested=(exit_event.is_set if exit_event is not None else None),
         )
+        self.event_sink = event_sink or PyObjCQuartzEventSink(self.guard.check)
         self.held_state = HeldInputState(self._input_lock)
         self.cursor_service = QuartzForegroundCursorService(self)
         self._monitor_stop = threading.Event()
@@ -265,6 +277,8 @@ class QuartzForegroundInteraction(BaseInteraction):
 
     def set_cursor_position(self, position: tuple[int, int]) -> None:
         point = float(position[0]), float(position[1])
+        if not all(math.isfinite(value) for value in point):
+            raise ValueError("global cursor position must contain finite coordinates")
         self._ordinary(lambda _geometry: self.event_sink.mouse_move(point))
 
     def click(

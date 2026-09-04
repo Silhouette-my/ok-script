@@ -130,7 +130,8 @@ class ForegroundGuard:
                 not target_exists
                 or not snapshot.exists
                 or snapshot.candidate is None
-                or snapshot.candidate.process_id <= 0):
+                or snapshot.candidate.process_id <= 0
+                or snapshot.candidate.window_id <= 0):
             raise ForegroundInputError(
                 "MAC_TARGET_EXITED", "selected macOS target is unavailable")
         for kind, code in (
@@ -155,6 +156,18 @@ class ForegroundGuard:
         if not frontmost:
             raise ForegroundInputError(
                 "MAC_GAME_NOT_FOREGROUND", "selected game is not frontmost")
+
+        # ``is_foreground()`` performs another live target/geometry check. Read
+        # the snapshot again so a same-size move discovered by that check cannot
+        # pass with the older generation captured above.
+        snapshot = self.target.snapshot
+        if (
+                not snapshot.exists
+                or snapshot.candidate is None
+                or snapshot.candidate.process_id <= 0
+                or snapshot.candidate.window_id <= 0):
+            raise ForegroundInputError(
+                "MAC_TARGET_EXITED", "selected macOS target is unavailable")
 
         diagnostics = self.capture.diagnostics()
         state = getattr(getattr(diagnostics, "state", None), "value", None)

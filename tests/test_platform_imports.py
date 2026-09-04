@@ -7,7 +7,7 @@ import textwrap
 
 import pytest
 
-from ok.platform import PlatformUnavailableError
+from ok.platform import PlatformUnavailableError, require_macos_foreground_host
 from ok.util.handler import ExitEvent
 
 
@@ -182,3 +182,25 @@ def test_current_import_state_contains_no_unexpected_win32_modules_on_non_window
     if sys.platform == 'win32':
         pytest.skip('Win32 modules are expected on Windows')
     assert not sorted(name for name in sys.modules if _is_forbidden(name))
+
+
+def test_macos_foreground_host_gate_requires_arm64_and_macos_13():
+    require_macos_foreground_host(
+        'test', platform_name='darwin', machine_name='arm64',
+        version_string='13.0')
+    with pytest.raises(PlatformUnavailableError, match='Apple Silicon arm64'):
+        require_macos_foreground_host(
+            'test', platform_name='darwin', machine_name='x86_64',
+            version_string='15.0')
+    with pytest.raises(PlatformUnavailableError, match='macOS 13.0'):
+        require_macos_foreground_host(
+            'test', platform_name='darwin', machine_name='arm64',
+            version_string='12.6')
+    with pytest.raises(PlatformUnavailableError, match='valid macOS version'):
+        require_macos_foreground_host(
+            'test', platform_name='darwin', machine_name='arm64',
+            version_string='')
+    with pytest.raises(PlatformUnavailableError, match='valid macOS version'):
+        require_macos_foreground_host(
+            'test', platform_name='darwin', machine_name='arm64',
+            version_string='latest')

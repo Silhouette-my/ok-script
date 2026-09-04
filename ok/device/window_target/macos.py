@@ -6,6 +6,8 @@ persistent ``SCStream`` implementation remains isolated in the capture layer.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 import threading
 import time
 from typing import Callable, Protocol
@@ -26,7 +28,7 @@ from ok.device.window_target.selection import (
     WindowSelectionStatus,
     select_window_candidate,
 )
-from ok.platform import MACOS, require_platform
+from ok.platform import require_macos_foreground_host
 
 
 class WindowDiscoveryError(RuntimeError):
@@ -46,6 +48,9 @@ class MacOSWindowSystem(Protocol):
 
     def window_exists(self, process_id: int, window_id: int) -> bool: ...
 
+    def window_geometry(
+            self, process_id: int, window_id: int) -> WindowGeometry | None: ...
+
     def request_activation(self, process_id: int) -> bool: ...
 
 
@@ -58,6 +63,18 @@ def _geometry_from_rect(
         rect,
         coordinate_space: WindowCoordinateSpace = (
             WindowCoordinateSpace.UNKNOWN)) -> WindowGeometry:
+    if isinstance(rect, Mapping):
+        try:
+            return WindowGeometry(
+                float(rect["X"]),
+                float(rect["Y"]),
+                float(rect["Width"]),
+                float(rect["Height"]),
+                coordinate_space,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise WindowDiscoveryError(
+                f"unsupported Core Graphics window bounds {rect!r}") from error
     try:
         return WindowGeometry(
             float(rect.origin.x),
@@ -81,7 +98,7 @@ class PyObjCMacOSWindowSystem:
     """Thin adapter around AppKit and ScreenCaptureKit public APIs."""
 
     def __init__(self):
-        require_platform("PyObjC macOS window system", (MACOS,))
+        require_macos_foreground_host("PyObjC macOS window system")
         import AppKit
         import Quartz
         import ScreenCaptureKit
@@ -172,20 +189,35 @@ class PyObjCMacOSWindowSystem:
         application = self._running_application(process_id)
         return bool(application is not None and not application.isTerminated())
 
-    def window_exists(self, process_id: int, window_id: int) -> bool:
+    def _window_info(self, process_id: int, window_id: int):
         if process_id <= 0 or window_id <= 0:
-            return False
+            return None
         windows = self._quartz.CGWindowListCopyWindowInfo(
             self._quartz.kCGWindowListOptionIncludingWindow,
             window_id,
         )
         if not windows:
-            return False
-        return any(
-            int(info.get(self._quartz.kCGWindowNumber, 0) or 0) == window_id
+            return None
+        return next((
+            info for info in windows
+            if int(info.get(self._quartz.kCGWindowNumber, 0) or 0) == window_id
             and int(info.get(self._quartz.kCGWindowOwnerPID, 0) or 0) == process_id
-            for info in windows
-        )
+        ), None)
+
+    def window_exists(self, process_id: int, window_id: int) -> bool:
+        return self._window_info(process_id, window_id) is not None
+
+    def window_geometry(
+            self, process_id: int, window_id: int) -> WindowGeometry | None:
+        info = self._window_info(process_id, window_id)
+        if info is None:
+            return None
+        bounds = info.get(self._quartz.kCGWindowBounds)
+        if bounds is None:
+            raise WindowDiscoveryError(
+                "Core Graphics returned a matching window without bounds")
+        return _geometry_from_rect(
+            bounds, WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS)
 
     def request_activation(self, process_id: int) -> bool:
         application = self._running_application(process_id)
@@ -366,7 +398,13 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
         if not snapshot.exists or candidate is None:
             return False
         try:
-            exists = self._candidate_exists(candidate)
+            process_exists = self.discovery.system.process_exists(candidate.process_id)
+            live_geometry = (
+                self.discovery.system.window_geometry(
+                    candidate.process_id, candidate.window_id)
+                if process_exists else None
+            )
+            exists = live_geometry is not None
         except Exception as error:
             with self._state_lock:
                 current = super().snapshot
@@ -378,16 +416,29 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                     self._update_candidate(None, exists=False)
             raise WindowDiscoveryError(
                 "failed to verify macOS window liveness") from error
-        if not exists:
-            with self._state_lock:
-                current = super().snapshot
-                if (
-                        current.generation == snapshot.generation
-                        and current.candidate is not None
-                        and current.candidate.runtime_identity
-                        == candidate.runtime_identity):
-                    self._update_candidate(None, exists=False)
-        return exists
+        with self._state_lock:
+            current = super().snapshot
+            if (
+                    current.generation != snapshot.generation
+                    or current.candidate is None
+                    or current.candidate.runtime_identity
+                    != candidate.runtime_identity):
+                return current.exists
+            if not exists:
+                self._update_candidate(None, exists=False)
+            elif live_geometry is not None and any(
+                    abs(left - right) > 0.5 for left, right in (
+                        (candidate.outer_geometry.x, live_geometry.x),
+                        (candidate.outer_geometry.y, live_geometry.y),
+                        (candidate.outer_geometry.width, live_geometry.width),
+                        (candidate.outer_geometry.height, live_geometry.height),
+                    )):
+                # CGWindow bounds are only a live invalidation probe. The next
+                # capture rebind still derives content geometry from the unique
+                # AXStandardWindow and SCWindow metadata.
+                self._update_candidate(
+                    replace(candidate, outer_geometry=live_geometry), exists=True)
+            return super().snapshot.exists
 
     def is_foreground(self) -> bool:
         return bool(
