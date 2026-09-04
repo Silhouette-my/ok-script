@@ -26,6 +26,11 @@ class TaskCard(ConfigCard):
         self.button_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.addWidget(self.button_container)
 
+        self.compatibility_label = QLabel(self)
+        self.compatibility_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.compatibility_label.setMaximumWidth(360)
+        self.compatibility_label.hide()
+
         self.waiting_label = QLabel(self)
         self.waiting_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.waiting_label.setMaximumWidth(360)
@@ -61,6 +66,7 @@ class TaskCard(ConfigCard):
 
         # Collect all buttons in display order
         self.all_buttons = [b for b in [
+            self.compatibility_label,
             self.waiting_label,
             self.instructions_button,
             self.edit_button,
@@ -72,14 +78,27 @@ class TaskCard(ConfigCard):
 
         self.update_buttons(self.task)
         communicate.task.connect(self.update_buttons)
+        communicate.adb_devices.connect(self._on_device_changed)
         task_callback = self.update_buttons
+        device_callback = self._on_device_changed
         self.destroyed.connect(
-            lambda *_args: communicate.task.disconnect(task_callback)
+            lambda *_args: (
+                communicate.task.disconnect(task_callback),
+                communicate.adb_devices.disconnect(device_callback),
+            )
         )
+
+    def _on_device_changed(self, *_args):
+        self.update_buttons(self.task)
 
     def dispose(self):
         """Release subscriptions before the Qt widget is deleted."""
         communicate.task.disconnect(self.update_buttons)
+        communicate.adb_devices.disconnect(self._on_device_changed)
+
+    def closeEvent(self, event):
+        self.dispose()
+        super().closeEvent(event)
 
     def _compact_header(self):
         """Display the task name and description in one compact row."""
@@ -102,6 +121,29 @@ class TaskCard(ConfigCard):
         self.card.setFixedHeight(compact_height)
         self.setViewportMargins(0, compact_height, 0, 0)
         self.setFixedHeight(compact_height)
+
+    def update_compatibility(self):
+        getter = getattr(self.task, 'get_device_compatibility_state', None)
+        state = getter() if callable(getter) else {
+            'status': 'compatible', 'level': None, 'missing': (), 'reason': ''
+        }
+        status = state.get('status', 'compatible')
+        level = state.get('level')
+        missing = tuple(state.get('missing') or ())
+        if status == 'missing-capabilities':
+            detail = f"missing: {', '.join(missing)}"
+        elif status in {'experimental', 'unsupported', 'validated'}:
+            detail = status
+        else:
+            detail = ''
+        if level and detail:
+            text = f'[{level} · {detail}]'
+        else:
+            text = f'[{detail}]' if detail else ''
+        self.compatibility_label.setText(text)
+        self.compatibility_label.setToolTip(state.get('reason') or text)
+        self.compatibility_label.setVisible(bool(text))
+        return status not in {'missing-capabilities', 'unsupported'}
 
     def update_content(self):
         content = ""
@@ -193,6 +235,7 @@ class TaskCard(ConfigCard):
             # Determine visibility for instructions button
             has_instructions = bool(getattr(self.task, 'instructions', None))
             self.instructions_button.setVisible(has_instructions)
+            device_compatible = self.update_compatibility()
             self.update_content()
 
             if self.onetime:
@@ -215,9 +258,13 @@ class TaskCard(ConfigCard):
                     self.start_button.setVisible(True)
                     self.pause_button.setVisible(False)
                     self.stop_button.setVisible(False)
+                self.start_button.setEnabled(device_compatible)
             else:
                 if self.enable_button:
                     self.enable_button.setChecked(task.enabled)
+                    # Keep an already-enabled incompatible task toggle usable so
+                    # the user can turn it off; new enablement remains blocked.
+                    self.enable_button.setEnabled(device_compatible or task.enabled)
 
             self._rebuild_button_layout()
 

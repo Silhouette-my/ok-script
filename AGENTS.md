@@ -56,6 +56,7 @@ Reusable platform capability belongs here:
 - Quartz foreground keyboard and mouse input
 - foreground/focus guard
 - held key/button state and `release_all()`
+- `DeviceCapabilities` and generic task capability gates
 - cursor service
 - permission service
 - coordinate conversion
@@ -111,7 +112,7 @@ Platform-neutral modules must import on Windows and macOS.
 
 - Production macOS input uses public Core Graphics Quartz events.
 - `pynput` may be an isolated diagnostic only, not the architectural backend.
-- Support independent key down/up, left/right/middle mouse down/up, absolute movement, and a real-game-tested relative/delta path.
+- Support independent key down/up, left/right/middle mouse down/up, absolute movement, and a separately declared relative/delta capability.
 - Immediately before every event or short atomic batch, verify the target exists, is alive, and is the system frontmost application.
 - Never send first and check focus afterward.
 - Do not use `CGEvent.postToPid` as a hidden background fallback.
@@ -120,14 +121,26 @@ Platform-neutral modules must import on Windows and macOS.
 - Ordinary input, focus invalidation, shutdown, and `release_all()` must share a thread-safe gate. Once invalidated, no new ordinary input may cross it.
 - On focus loss, only releases corresponding to tracked held state may be posted; do not generate movement, clicks, scrolling, text, or new down events.
 - Shutdown order is: block new input, call `release_all()`, stop capture/workers, then destroy Qt/Python objects.
-- Relative camera movement remains `not-implemented` or `unit-tested` until validated in the official game on real hardware; combat/route support may not be claimed before that gate passes.
+- Relative camera movement remains `not-implemented` or `unit-tested` until validated in the official game on real hardware.
+- Do not make `relative_mouse` a global release blocker. A consumer may ship hardware-validated basic or locked-gameplay tasks that do not require free-camera delta.
+- Only tasks that explicitly require `relative_mouse` are blocked by that missing capability. Free-camera routes and complete camera parity may not be claimed before the corresponding gate passes.
+
+## Capability Model
+
+`ok-script` owns a platform-neutral, fail-closed `DeviceCapabilities` model. At minimum it distinguishes keyboard tap, keyboard hold, absolute mouse, left/right/middle buttons, button hold, scroll, relative mouse, and foreground-only guarantees.
+
+- All new providers default every capability to false until explicitly declared.
+- Task requirements are checked before enablement and immediately before execution.
+- An inherited empty method never implies a capability is available.
+- Game-specific levels such as `MAC_BASIC`, `MAC_LOCKED_GAMEPLAY`, and `MAC_FULL_CAMERA` belong in the consumer repository; the framework only exposes precise capabilities and generic matching.
+- Provider capability evidence and consumer task support status are separate axes.
 
 ## Permissions
 
 - Use supported screen-capture and Accessibility preflight/request APIs.
 - Missing permission is an explicit actionable state, not a retry loop.
 - Never modify TCC databases, request root to bypass permission, or claim Terminal/Python permission proves packaged-app permission.
-- Packaged-app acceptance must use a stable bundle identifier.
+- Packaged-app acceptance must use a stable bundle identifier. Establish an internal stable-identity `.app` early enough to test TCC behavior after the window/permission boundary exists; do not postpone permission identity until all tasks are complete.
 
 ## Testing and Windows Regression
 
@@ -150,6 +163,14 @@ Required tests include:
 - shutdown and fatal capture paths calling `release_all()`
 
 CI must not require the game to be installed. Real-game results must be recorded separately from automated tests.
+
+## MaaEnd / MaaFramework Reference Boundary
+
+MaaEnd/MaaFramework may be studied as evidence that ScreenCaptureKit plus Quartz CGEvent is viable. Do not add MaaFramework as an MVP runtime dependency, copy its one-shot screenshot loop, use `SCWindow.frame` as content pixel size, reactivate the target before every event, or infer background support from its background controller. A future runtime dependency requires its own ADR.
+
+## Documentation Language
+
+New or modified macOS engineering constraints, implementation plans, and acceptance records use Chinese by default. Keep API names, class names, function names, paths, configuration keys, log state codes, and commands in English.
 
 ## Capability Claims
 

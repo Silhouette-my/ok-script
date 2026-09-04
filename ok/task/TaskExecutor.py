@@ -9,7 +9,7 @@ from ok.task.exceptions import FinishedException, TaskDisabledException, WaitFai
 from ok.util.GlobalConfig import basic_options
 from ok.util.logger import Logger, config_logger
 from ok.util.process import is_cuda_12_or_above, prevent_sleeping
-from ok.util.window import ratio_text_to_number
+from ok.util.collection import parse_ratio
 
 logger = Logger.get_logger(__name__)
 
@@ -227,7 +227,7 @@ class TaskExecutor:
             actual_ratio = 0
         else:
             actual_ratio = width / height
-        supported_ratio = ratio_text_to_number(supported_ratio)
+        supported_ratio = parse_ratio(supported_ratio)
         # Calculate the difference between the actual and supported ratios
         difference = abs(actual_ratio - supported_ratio)
         support = difference <= 0.01 * supported_ratio
@@ -548,6 +548,9 @@ class TaskExecutor:
             elif time.time() - self._last_frame_time > 0.2:
                 self.reset_scene()
             try:
+                # Re-check immediately before execution so a device/provider change
+                # cannot let an already queued task reach an unsupported empty method.
+                task.ensure_device_capabilities()
                 task.start_time = time.time()
                 task.running = True
                 self.current_task = task

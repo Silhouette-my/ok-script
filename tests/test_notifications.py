@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -6,6 +7,10 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
+
+if sys.platform != 'win32':
+    pytest.skip('Windows desktop notification tests require Win32', allow_module_level=True)
+
 import win32con
 
 from ok.notification.providers import (

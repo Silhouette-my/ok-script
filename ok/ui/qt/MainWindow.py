@@ -16,7 +16,11 @@ _pyappify_stop_lock = threading.Lock()
 
 
 def request_pyappify_shutdown():
-    """Terminate the launcher without ever blocking Qt's GUI thread."""
+    """Terminate the Windows launcher without blocking Qt's GUI thread."""
+    if not is_windows():
+        logger.info('PyAppify launcher shutdown is unavailable on this platform')
+        return None
+
     def stop_launcher():
         if not _pyappify_stop_lock.acquire(blocking=False):
             return
@@ -48,6 +52,7 @@ MessageBoxBase.keyPressEvent = _patched_message_box_base_keyPressEvent
 
 
 from ok.util.config import Config
+from ok.platform import is_windows
 
 from ok.ui.qt.Communicate import communicate
 from ok.ui.qt.common.accent_color import qfluent_theme_source_color
@@ -303,6 +308,8 @@ class MainWindow(FluentWindow):
     @staticmethod
     def _get_dwm_accent_color():
         """Return the DWM accent color as a compatibility fallback."""
+        if not is_windows():
+            return None
         try:
             import ctypes
             from ctypes import wintypes
@@ -327,6 +334,8 @@ class MainWindow(FluentWindow):
 
     def get_system_primary_theme_color(self):
         """Return a qfluent source color matching the Windows primary fill."""
+        if not is_windows():
+            return None
         dark = isDarkTheme()
         try:
             from ok.rotypes.Windows.UI.ViewManagement import UIColorType, get_color_value
@@ -544,6 +553,8 @@ class MainWindow(FluentWindow):
         self.switchTo(self.about_tab)
 
     def show_startup_version_change_notice(self):
+        if not is_windows():
+            return
         version_change = get_startup_version_change()
         if not version_change:
             return
@@ -555,21 +566,24 @@ class MainWindow(FluentWindow):
         first_show = event.type() == QEvent.Show and not self.shown
         if first_show:
             self.shown = True
-            pyappify.hide_pyappify()
-            if update_pyappify := self.config.get("update_pyappify"):
-                pyappify.upgrade(
-                    update_pyappify.get('to_version'),
-                    update_pyappify.get('sha256'),
-                    [update_pyappify.get('zip_url')],
-                    exit_event=self.exit_event,
-                )
+            if is_windows():
+                pyappify.hide_pyappify()
+                if update_pyappify := self.config.get("update_pyappify"):
+                    pyappify.upgrade(
+                        update_pyappify.get('to_version'),
+                        update_pyappify.get('sha256'),
+                        [update_pyappify.get('zip_url')],
+                        exit_event=self.exit_event,
+                    )
+            elif self.config.get("update_pyappify"):
+                logger.info('Ignoring Windows PyAppify update configuration on this platform')
             logger.info("Window has fully displayed")
             from ok import og
             og.ok.start_runtime()
             if self.basic_global_config.get(KILL_LAUNCHER_AFTER_START):
                 logger.info(f'MainWindow showEvent Kill Launcher After Start')
                 request_pyappify_shutdown()
-            startup_version_change = get_startup_version_change()
+            startup_version_change = get_startup_version_change() if is_windows() else None
             if self.version != self.main_window_config.get('last_version'):
                 self.main_window_config['last_version'] = self.version
                 if not self.config.get('auth') and not startup_version_change:

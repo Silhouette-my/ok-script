@@ -2,7 +2,7 @@ import time
 
 from ok import Handler, og
 from ok import Logger
-from ok.device.capture import BaseWindowsCaptureMethod, BrowserCaptureMethod
+from ok.device.capture_methods.base import BaseWindowsCaptureMethod
 from ok.core.events import communicate
 from ok.core.notifications import alert_error, alert_info
 from ok.util.process import is_admin, execute, WINDOWS_START_METHOD_START
@@ -31,6 +31,7 @@ class StartController:
 
     @staticmethod
     def _mark_task_enabled(task):
+        task.ensure_device_capabilities()
         if not task.enabled:
             task._enabled = True
             task.info_clear()
@@ -284,18 +285,18 @@ class StartController:
     def check_device_error(self):
         try:
             device = og.device_manager.get_preferred_device()
+            if not device:
+                return self.tr('No game selected!')
             error_msg = self.tr("{} is not connected, please select the game window.").format(
                 device['nick'])
             logger.info(f'test check_device_error msg: {error_msg}')
-            if not device:
-                return self.tr('No game selected!')
             if og.device_manager.capture_method is None:
                 return self.tr("Selected capture method is not supported by the game or your system!")
             if not og.device_manager.device_connected():
                 logger.error(f'Emulator is not connected {og.device_manager.device}')
                 return self.tr("Emulator is not connected, start the emulator first!")
-            if isinstance(og.device_manager.capture_method,
-                          BrowserCaptureMethod) and not og.device_manager.capture_method.connected():
+            if (device and device.get('device') == 'browser'
+                    and not og.device_manager.capture_method.connected()):
                 logger.info(f"start browser")
                 og.device_manager.capture_method.start_browser()
             if not og.device_manager.capture_method.connected():

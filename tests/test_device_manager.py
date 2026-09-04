@@ -30,6 +30,22 @@ class TestEmulatorWindowExe(unittest.TestCase):
             resolve_emulator_window_exe(executable, 'leidian0'))
 
 
+class TestDeviceManagerInteractionSelection(unittest.TestCase):
+    def test_adb_interaction_selection_does_not_require_windows_backend(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.config = {'preferred': 'phone', 'interaction': ''}
+        manager.device_dict = {'phone': {'imei': 'phone', 'device': 'adb'}}
+        manager.windows_capture_config = None
+        manager.win_interaction_class = None
+        manager.start = Mock()
+
+        manager.set_interaction('ADBInteraction')
+
+        self.assertEqual('ADBInteraction', manager.config['interaction'])
+        self.assertIsNone(manager.win_interaction_class)
+        manager.start.assert_called_once_with()
+
+
 class TestDeviceManagerPcWindows(unittest.TestCase):
     def make_manager(self):
         manager = DeviceManager.__new__(DeviceManager)

@@ -7,6 +7,11 @@ from numpy import ndarray
 
 from ok.core.events import communicate
 from ok.core.icons import Icon
+from ok.device.capabilities import (
+    DeviceCapabilities,
+    MissingDeviceCapabilitiesError,
+    NO_DEVICE_CAPABILITIES,
+)
 from ok.feature.Box import find_boxes_by_name, find_boxes_within_boundary, Box, find_box_by_name, relative_box, \
     sort_boxes, find_highest_confidence_box
 from ok.feature.FeatureSet import adjust_coordinates, resize_image, scale_box, join_list_elements
@@ -1074,6 +1079,8 @@ class BaseTask(OCR):
     任务的基类。
     """
 
+    required_capabilities: DeviceCapabilities = NO_DEVICE_CAPABILITIES
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = self.__class__.__name__
@@ -1113,6 +1120,7 @@ class BaseTask(OCR):
         old_ifo = task.info
         task.info = self.info
         try:
+            task.ensure_device_capabilities()
             task.run()
         except Exception as e:
             self.log_error(f'run_task_by_class {cls}', e)
@@ -1172,11 +1180,53 @@ class BaseTask(OCR):
         if config:
             return self.executor.device_manager.ensure_capture(config)
 
+    def get_required_capabilities(self) -> DeviceCapabilities:
+        """返回当前设备运行本任务所需的能力。
+
+        游戏项目可以覆写此方法，根据所选 provider 返回平台特定要求；默认任务
+        不增加能力限制，以保持现有消费者兼容。
+        """
+        required = self.required_capabilities
+        return required if isinstance(required, DeviceCapabilities) else NO_DEVICE_CAPABILITIES
+
+    def get_device_capabilities(self) -> DeviceCapabilities:
+        manager = getattr(self.executor, 'device_manager', None)
+        capabilities = getattr(manager, 'capabilities', NO_DEVICE_CAPABILITIES)
+        return capabilities if isinstance(capabilities, DeviceCapabilities) else NO_DEVICE_CAPABILITIES
+
+    def missing_device_capabilities(self) -> tuple[str, ...]:
+        return self.get_device_capabilities().missing(self.get_required_capabilities())
+
+    def get_device_compatibility_state(self) -> dict:
+        """返回供通用 UI/接口消费的稳定兼容状态。
+
+        consumer 可增加 ``experimental`` / ``unsupported`` 等状态，但不得把
+        capability 缺失包装成可运行状态。
+        """
+        missing = self.missing_device_capabilities()
+        return {
+            'status': 'missing-capabilities' if missing else 'compatible',
+            'level': None,
+            'missing': missing,
+            'reason': '',
+        }
+
+    def is_device_compatible(self) -> bool:
+        return self.get_device_compatibility_state()['status'] not in {
+            'missing-capabilities', 'unsupported'
+        }
+
+    def ensure_device_capabilities(self) -> None:
+        missing = self.missing_device_capabilities()
+        if missing:
+            raise MissingDeviceCapabilitiesError(missing, self.name)
+
     def update_capture(self, config):
         return self.executor.device_manager.update_capture(config)
 
     def enable(self):
         if not self._enabled:
+            self.ensure_device_capabilities()
             self._enabled = True
             self.info_clear()
             self.ensure_capture()

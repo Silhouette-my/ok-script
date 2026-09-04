@@ -1,5 +1,6 @@
 import time
 
+from ok.device.capabilities import DeviceCapabilities, NO_DEVICE_CAPABILITIES
 from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
@@ -7,6 +8,7 @@ logger = Logger.get_logger(__name__)
 class BaseInteraction:
 
     KEY_LOG_INTERVAL = 1.0
+    capabilities: DeviceCapabilities = NO_DEVICE_CAPABILITIES
 
     def __init__(self, capture):
         self.capture = capture
@@ -14,6 +16,13 @@ class BaseInteraction:
 
     def should_capture(self):
         return True
+
+    def get_capabilities(self) -> DeviceCapabilities:
+        """返回后端已明确声明并验证到实现层的能力。
+
+        未覆盖此方法的新后端继承全 False，防止空实现被任务误当作可用。
+        """
+        return self.capabilities
 
     def send_key(self, key, down_time=0.02):
         now = time.monotonic()

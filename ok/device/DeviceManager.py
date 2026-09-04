@@ -1,23 +1,61 @@
+from __future__ import annotations
+
+import ntpath
 import os
 import re
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
 
-import cv2
-import numpy as np
+if TYPE_CHECKING:
+    import numpy as np
 
-from ok.device.capture import HwndWindow, BrowserCaptureMethod, update_capture_method, NemuIpcCaptureMethod, \
-    ADBCaptureMethod
-from ok.device.interaction import PostMessageInteraction, GenshinInteraction, ForegroundPostMessageInteraction, \
-    PynputInteraction, PyDirectInteraction, BrowserInteraction, ADBInteraction
+from ok.device.capabilities import DeviceCapabilities, NO_DEVICE_CAPABILITIES
+from ok.device.capture_methods import ADBCaptureMethod, NemuIpcCaptureMethod
+from ok.device.interaction_methods import ADBInteraction, BrowserInteraction
+from ok.device.services import create_cursor_service
 from ok.core.events import communicate
+from ok.platform import PlatformUnavailableError, is_windows, require_windows
 from ok.util.collection import parse_ratio
 from ok.util.config import Config
 from ok.util.file import delete_if_exists
 from ok.util.handler import Handler
 from ok.util.logger import Logger
 from ok.util.process import kill_exe
-from ok.util.window import windows_graphics_available, find_hwnd
+
+
+if is_windows():
+    from ok.device.capture import HwndWindow, BrowserCaptureMethod, update_capture_method
+    from ok.device.interaction import (
+        PostMessageInteraction,
+        GenshinInteraction,
+        ForegroundPostMessageInteraction,
+        PynputInteraction,
+        PyDirectInteraction,
+    )
+    from ok.util.window import windows_graphics_available, find_hwnd
+else:
+    class _UnavailableWindowsComponent:
+        def __init__(self, *_args, **_kwargs):
+            require_windows(type(self).__name__)
+
+    HwndWindow = _UnavailableWindowsComponent
+    BrowserCaptureMethod = _UnavailableWindowsComponent
+    PostMessageInteraction = _UnavailableWindowsComponent
+    GenshinInteraction = _UnavailableWindowsComponent
+    ForegroundPostMessageInteraction = _UnavailableWindowsComponent
+    PynputInteraction = _UnavailableWindowsComponent
+    PyDirectInteraction = _UnavailableWindowsComponent
+
+    def update_capture_method(*_args, **_kwargs):
+        raise PlatformUnavailableError('Windows capture is unavailable on this platform')
+
+    def windows_graphics_available():
+        return False
+
+    def find_hwnd(*_args, **_kwargs):
+        raise PlatformUnavailableError('Win32 window discovery is unavailable on this platform')
 
 logger = Logger.get_logger(__name__)
 
@@ -27,19 +65,37 @@ def resolve_emulator_window_exe(exe_path, instance_name=None):
     if not exe_path:
         return exe_path
 
-    normalized_path = os.path.normpath(exe_path)
-    if os.path.basename(normalized_path).lower() != 'mumunxmain.exe':
+    # Emulator paths are Windows paths even when this pure helper is tested
+    # from another host, so use ntpath rather than the host path module.
+    normalized_path = ntpath.normpath(exe_path)
+    if ntpath.basename(normalized_path).lower() != 'mumunxmain.exe':
         return exe_path
 
     match = re.search(r'-(\d+(?:\.\d+)+)-\d+$', instance_name or '')
     version = match.group(1) if match else '12.0'
-    install_root = os.path.dirname(os.path.dirname(normalized_path))
-    return os.path.join(
+    install_root = ntpath.dirname(ntpath.dirname(normalized_path))
+    return ntpath.join(
         install_root, 'nx_device', version, 'shell', 'MuMuNxDevice.exe')
 
 
 def method_name(method):
     return method.__name__ if isinstance(method, type) else str(method)
+
+
+def _windows_interaction_class(selected_interaction):
+    require_windows('Windows interaction backend selection')
+    mapping = {
+        'PostMessage': PostMessageInteraction,
+        'Genshin': GenshinInteraction,
+        'ForegroundPostMessage': ForegroundPostMessageInteraction,
+        'Pynput': PynputInteraction,
+        'PyDirect': PyDirectInteraction,
+    }
+    if isinstance(selected_interaction, type):
+        return selected_interaction
+    if selected_interaction:
+        return mapping.get(selected_interaction, selected_interaction)
+    return PynputInteraction
 
 
 class DeviceManager:
@@ -50,6 +106,7 @@ class DeviceManager:
         self._adb = None
         self.executor = None
         self.capture_method = None
+        self.cursor_service = create_cursor_service()
         self.global_config = global_config
         self._adb_lock = threading.Lock()
         if app_config.get('adb'):
@@ -59,16 +116,34 @@ class DeviceManager:
         supported_resolution = app_config.get(
             'supported_resolution', {})
         self.supported_ratio = parse_ratio(supported_resolution.get('ratio'))
-        self.windows_capture_config = app_config.get('windows')
+        configured_windows = app_config.get('windows')
+        configured_browser = app_config.get('browser')
+        self.windows_capture_config = configured_windows if is_windows() else None
         self.adb_capture_config = app_config.get('adb')
-        self.browser_config = app_config.get('browser')
+        # The existing browser capture implementation is HWND/WGC based. Keep
+        # it available on Windows without importing it into the Darwin graph.
+        self.browser_config = configured_browser if is_windows() else None
         self.debug = app_config.get('debug')
         self.interaction = None
         self.device_dict = {}
         self.exit_event = exit_event
         self.resolution_dict = {}
-        default_capture = 'windows' if app_config.get('windows') else (
-            'browser' if app_config.get('browser') else 'adb')
+        self.win_interaction_class = None
+        self.hwnd_window = None
+
+        if configured_windows and not is_windows():
+            logger.info('Windows desktop configuration is unavailable on this platform')
+        if configured_browser and not is_windows():
+            logger.info('The current browser capture provider is Windows-only')
+
+        if self.windows_capture_config is not None:
+            default_capture = 'windows'
+        elif self.browser_config is not None:
+            default_capture = 'browser'
+        elif self.adb_capture_config is not None:
+            default_capture = 'adb'
+        else:
+            default_capture = ''
         self.config = Config("devices",
                              {"preferred": "", "pc_full_path": "", 'capture': default_capture, 'selected_exe': '',
                               'selected_hwnd': 0, 'interaction': ''})
@@ -84,10 +159,7 @@ class DeviceManager:
                                           top_hwnd_class=self.windows_capture_config.get('top_hwnd_class'))
             interaction = self.windows_capture_config.get('interaction')
             if isinstance(interaction, list):
-                if interaction:
-                    selected_interaction = interaction[0]
-                else:
-                    selected_interaction = 'Pynput'
+                selected_interaction = interaction[0] if interaction else 'Pynput'
             else:
                 selected_interaction = interaction
 
@@ -104,22 +176,7 @@ class DeviceManager:
                     if saved_interaction == item_name:
                         selected_interaction = interaction
 
-            if selected_interaction == 'PostMessage':
-                self.win_interaction_class = PostMessageInteraction
-            elif selected_interaction == 'Genshin':
-                self.win_interaction_class = GenshinInteraction
-            elif selected_interaction == 'ForegroundPostMessage':
-                self.win_interaction_class = ForegroundPostMessageInteraction
-            elif selected_interaction == 'Pynput':
-                self.win_interaction_class = PynputInteraction
-            elif selected_interaction == 'PyDirect':
-                self.win_interaction_class = PyDirectInteraction
-            elif selected_interaction:
-                self.win_interaction_class = selected_interaction
-            else:
-                self.win_interaction_class = PynputInteraction
-        else:
-            self.hwnd_window = None
+            self.win_interaction_class = _windows_interaction_class(selected_interaction)
 
         logger.info('__init__ end')
 
@@ -367,7 +424,7 @@ class DeviceManager:
         logger.debug(f'refresh_phones done')
 
     def refresh_emulators(self, current=False):
-        if self.adb_capture_config is None:
+        if self.adb_capture_config is None or not is_windows():
             return
         from ok.alas.emulator_windows import EmulatorManager
         manager = EmulatorManager()
@@ -490,6 +547,9 @@ class DeviceManager:
         if device is None:
             return None
         try:
+            import cv2
+            import numpy as np
+
             png_bytes = self.shell_device(device, "screencap -p", encoding=None, timeout=10)
             if png_bytes is not None and len(png_bytes) > 0:
                 image_data = np.frombuffer(png_bytes, dtype=np.uint8)
@@ -533,6 +593,16 @@ class DeviceManager:
         imei = self.config.get("preferred")
         preferred = self.device_dict.get(imei)
         return preferred
+
+    @property
+    def capabilities(self) -> DeviceCapabilities:
+        """返回当前 interaction 后端声明的能力，未就绪时 fail closed。"""
+        interaction = self.interaction
+        if interaction is None:
+            return NO_DEVICE_CAPABILITIES
+        getter = getattr(interaction, 'get_capabilities', None)
+        capabilities = getter() if callable(getter) else getattr(interaction, 'capabilities', None)
+        return capabilities if isinstance(capabilities, DeviceCapabilities) else NO_DEVICE_CAPABILITIES
 
     def get_preferred_capture(self):
         return self.config.get("capture")
@@ -592,31 +662,29 @@ class DeviceManager:
 
     def set_interaction(self, interaction):
         interaction_name = interaction.__name__ if isinstance(interaction, type) else interaction
-        
-        config_interaction = self.windows_capture_config.get('interaction') if self.windows_capture_config else None
-        if isinstance(interaction, str):
-            if isinstance(config_interaction, list):
-                for item in config_interaction:
-                    if isinstance(item, type) and item.__name__ == interaction:
-                        interaction = item
-                        break
-            elif isinstance(config_interaction, type) and config_interaction.__name__ == interaction:
-                interaction = config_interaction
+        preferred = self.get_preferred_device() or {}
+        is_windows_device = preferred.get('device') == 'windows'
+
+        if is_windows_device:
+            require_windows('Windows interaction selection')
+            config_interaction = (
+                self.windows_capture_config.get('interaction')
+                if self.windows_capture_config else None
+            )
+            if isinstance(interaction, str):
+                if isinstance(config_interaction, list):
+                    for item in config_interaction:
+                        if isinstance(item, type) and item.__name__ == interaction:
+                            interaction = item
+                            break
+                elif (isinstance(config_interaction, type)
+                      and config_interaction.__name__ == interaction):
+                    interaction = config_interaction
 
         if self.config.get("interaction") != interaction_name:
             self.config['interaction'] = interaction_name
-            if interaction == 'PostMessage':
-                self.win_interaction_class = PostMessageInteraction
-            elif interaction == 'Genshin':
-                self.win_interaction_class = GenshinInteraction
-            elif interaction == 'ForegroundPostMessage':
-                self.win_interaction_class = ForegroundPostMessageInteraction
-            elif interaction == 'Pynput':
-                self.win_interaction_class = PynputInteraction
-            elif interaction and interaction != 'PyDirect':
-                self.win_interaction_class = interaction
-            else:
-                self.win_interaction_class = PyDirectInteraction
+            if is_windows_device:
+                self.win_interaction_class = _windows_interaction_class(interaction)
             self.start()
 
     def get_hwnd_name(self):
@@ -624,6 +692,7 @@ class DeviceManager:
         return preferred.get('hwnd')
 
     def ensure_hwnd(self, title, exe, frame_width=0, frame_height=0, player_id=-1, hwnd_class=None, top_hwnd_class=None):
+        require_windows('HWND window management')
         if self.hwnd_window is None:
             self.hwnd_window = HwndWindow(self.exit_event, title, exe, frame_width, frame_height, player_id,
                                           hwnd_class, global_config=self.global_config, device_manager=self, top_hwnd_class=top_hwnd_class)
@@ -631,6 +700,7 @@ class DeviceManager:
             self.hwnd_window.update_window(title, exe, frame_width, frame_height, player_id, hwnd_class, top_hwnd_class)
 
     def use_windows_capture(self):
+        require_windows('Windows capture provider')
         selected_method = self.config.get('capture')
         valid_methods = self.windows_capture_config.get('capture_method', [])
         if not selected_method or selected_method not in valid_methods:
@@ -659,6 +729,7 @@ class DeviceManager:
             return
 
         if preferred['device'] == 'windows':
+            require_windows('Windows desktop device')
             title = self.windows_capture_config.get('title')
             exe = self.windows_capture_config.get('exe')
             if not exe and not title and preferred.get('real_hwnd'):
@@ -825,6 +896,7 @@ class DeviceManager:
         if not path:
             return None
         elif emulator := device.get('emulator'):
+            require_windows('Windows emulator launch')
             from ok.alas.platform_windows import get_emulator_exe
             return get_emulator_exe(emulator)
         else:
@@ -866,6 +938,7 @@ class DeviceManager:
         import time
         logger.info(f'update_capture {config}')
         if 'windows' in config:
+            require_windows('Windows capture update')
             win_config = config['windows']
             reset_selected_hwnd = any(
                 key in win_config for key in ('title', 'exe', 'hwnd_class', 'top_hwnd_class', 'selected_hwnd')
@@ -960,6 +1033,7 @@ class DeviceManager:
                         raise Exception(f"Failed to resize ADB to {resolution}: {e}")
 
         elif 'browser' in config:
+            require_windows('Current browser capture provider')
             browser_config = config['browser']
             self.clear_devices()
             if not getattr(self, 'browser_config', None):
@@ -989,6 +1063,7 @@ class DeviceManager:
         logger.info(f'ensure_capture {config}')
         self.clear_devices()
         if 'windows' in config:
+            require_windows('Windows capture ensure')
             win_config = config['windows']
             for key in ('title', 'hwnd_class', 'top_hwnd_class'):
                 if key in win_config:
@@ -1077,6 +1152,7 @@ class DeviceManager:
                         raise Exception(f"Failed to resize ADB to {resolution}: {e}")
 
         elif 'browser' in config:
+            require_windows('Current browser capture provider')
             browser_config = config['browser']
             if not getattr(self, 'browser_config', None):
                 self.browser_config = {}
