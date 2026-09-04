@@ -1,7 +1,16 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ok.device.DeviceManager import DeviceManager, resolve_emulator_window_exe
+from ok.device.window_target import (
+    StableWindowHint,
+    WindowCandidate,
+    WindowGeometry,
+    WindowMatchHints,
+    WindowSelectionResult,
+    WindowSelectionStatus,
+)
 
 
 class TestEmulatorWindowExe(unittest.TestCase):
@@ -44,6 +53,110 @@ class TestDeviceManagerInteractionSelection(unittest.TestCase):
         self.assertEqual('ADBInteraction', manager.config['interaction'])
         self.assertIsNone(manager.win_interaction_class)
         manager.start.assert_called_once_with()
+
+
+class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
+    def make_manager(self, selection):
+        discovery = Mock()
+        discovery.select.return_value = selection
+        bound_target = Mock()
+        bound_target.exists.return_value = selection.selected is not None
+        bound_target.snapshot = SimpleNamespace(candidate=selection.selected)
+        discovery.bind.return_value = bound_target
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.macos_window_config = {
+            'bundle_identifiers': [],
+            'application_names': [],
+            'title_patterns': ['Game'],
+            'allowed_layers': [0],
+        }
+        manager.config = {'macos_target_hint': {}}
+        manager.window_discovery = discovery
+        manager.permission_service = Mock()
+        manager.window_target = None
+        manager.device_dict = {}
+        return manager, discovery
+
+    def test_manual_selection_persists_only_stable_identity(self):
+        selected = WindowCandidate(
+            process_id=42,
+            window_id=7,
+            bundle_identifier='com.example.game',
+            application_name='Example Game',
+            title='Game',
+            layer=0,
+            outer_geometry=WindowGeometry(0, 0, 1280, 720),
+        )
+        selection = WindowSelectionResult(
+            WindowSelectionStatus.SELECTED, (selected,), selected)
+        manager, discovery = self.make_manager(selection)
+
+        with patch('ok.device.DeviceManager.require_platform'):
+            result = manager.bind_macos_window(manual_window_id=7)
+
+        self.assertIs(result, selection)
+        self.assertIs(manager.window_target, discovery.bind.return_value)
+        self.assertEqual({
+            'bundle_identifier': 'com.example.game',
+            'application_name': 'Example Game',
+            'title': 'Game',
+        }, manager.config['macos_target_hint'])
+        self.assertNotIn('process_id', manager.config['macos_target_hint'])
+        self.assertNotIn('window_id', manager.config['macos_target_hint'])
+        self.assertFalse(manager.device_dict['macos']['connected'])
+        self.assertTrue(manager.device_dict['macos']['target_bound'])
+        self.assertEqual(42, manager.device_dict['macos']['process_id'])
+        discovery.select.assert_called_once_with(
+            WindowMatchHints(
+                title_patterns=('Game',),
+                allowed_layers=(0,),
+            ),
+            stable_hint=StableWindowHint(),
+            manual_window_id=7,
+        )
+
+    def test_ambiguous_selection_does_not_leave_a_stale_target(self):
+        selection = WindowSelectionResult(
+            WindowSelectionStatus.MANUAL_SELECTION_REQUIRED, ())
+        manager, discovery = self.make_manager(selection)
+        manager.window_target = object()
+
+        with patch('ok.device.DeviceManager.require_platform'):
+            result = manager.bind_macos_window()
+
+        self.assertIs(result, selection)
+        self.assertIsNone(manager.window_target)
+        self.assertFalse(manager.device_dict['macos']['target_bound'])
+        discovery.bind.assert_not_called()
+
+    def test_macos_device_is_target_only_and_never_falls_into_adb_start(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.macos_window_config = {'title_patterns': ['Game']}
+        manager.device_dict = {
+            'macos': {
+                'imei': 'macos',
+                'device': 'macos',
+                'connected': False,
+            },
+        }
+        manager.config = {'preferred': 'macos'}
+        manager.window_target = Mock()
+        manager.window_target.exists.return_value = True
+        manager.capture_method = Mock()
+        previous_capture = manager.capture_method
+        manager.interaction = object()
+
+        with patch('ok.device.DeviceManager.require_platform'):
+            manager.do_start(notify=False)
+
+        previous_capture.close.assert_called_once_with()
+        self.assertIsNone(manager.capture_method)
+        self.assertIsNone(manager.interaction)
+        self.assertTrue(manager.device_dict['macos']['target_bound'])
+        self.assertFalse(manager.device_dict['macos']['connected'])
+        self.assertEqual([], manager.available_capture_methods())
+        self.assertEqual([], manager.available_interaction_methods())
+        self.assertFalse(manager.device_connected())
 
 
 class TestDeviceManagerPcWindows(unittest.TestCase):
