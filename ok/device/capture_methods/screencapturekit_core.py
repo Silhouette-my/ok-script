@@ -39,12 +39,22 @@ class StreamFrameMetadata:
     content_rect_points: WindowGeometry | None = None
     display_scale: float | None = None
     content_scale: float | None = None
+    screen_rect_points: WindowGeometry | None = None
+    global_content_geometry: WindowGeometry | None = None
 
     def __post_init__(self) -> None:
         for name in ("display_scale", "content_scale"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{name} must be finite and positive when known")
+        for name in ("screen_rect_points", "global_content_geometry"):
+            geometry = getattr(self, name)
+            if (
+                    geometry is not None
+                    and geometry.coordinate_space is not
+                    WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS):
+                raise ValueError(
+                    f"{name} must use macOS logical points when known")
 
 
 @dataclass(frozen=True)

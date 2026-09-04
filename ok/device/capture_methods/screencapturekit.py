@@ -21,6 +21,7 @@ from ok.device.capture_methods.screencapturekit_core import (
 )
 from ok.device.services import PermissionKind
 from ok.device.window_target.base import (
+    WindowCandidate,
     WindowCoordinateSpace,
     WindowGeometry,
     WindowTargetSnapshot,
@@ -134,13 +135,42 @@ def _rect_components(rect) -> tuple[float, float, float, float]:
             float(rect.size.height),
         )
     except AttributeError:
+        pass
+
+    # On current PyObjC, SCStreamFrameInfoContentRect may bridge as the
+    # dictionary representation produced by CGRectCreateDictionaryRepresentation
+    # instead of as a CGRect/NSValue.  NSDictionary supports ``get`` here.
+    getter = getattr(rect, "get", None)
+    if callable(getter):
+        values = tuple(getter(key) for key in ("X", "Y", "Width", "Height"))
+        if all(value is not None for value in values):
+            x, y, width, height = values
+            return float(x), float(y), float(width), float(height)
+
+    try:
         (x, y), (width, height) = rect
-        return float(x), float(y), float(width), float(height)
+    except (TypeError, ValueError):
+        try:
+            x, y, width, height = rect
+        except (TypeError, ValueError) as error:
+            raise ScreenCaptureKitCaptureError(
+                f"unsupported ScreenCaptureKit rectangle {rect!r}") from error
+    return float(x), float(y), float(width), float(height)
 
 
 def _surface_rect(rect) -> WindowGeometry:
     x, y, width, height = _rect_components(rect)
     return WindowGeometry(x, y, width, height, WindowCoordinateSpace.UNKNOWN)
+
+
+def _request_automatic_capture_resolution(configuration, screen_capture_kit) -> bool:
+    """Keep explicit output dimensions authoritative for HiDPI window capture."""
+    setter = getattr(configuration, "setCaptureResolution_", None)
+    automatic = getattr(screen_capture_kit, "SCCaptureResolutionAutomatic", None)
+    if callable(setter) and automatic is not None:
+        setter(automatic)
+        return True
+    return False
 
 
 def _with_locked_bgra_pixel_buffer(quartz, pixel_buffer, consumer):
@@ -179,6 +209,8 @@ class PyObjCScreenCaptureKitBackend:
 
     def __init__(self):
         require_platform("ScreenCaptureKit capture", (MACOS,))
+        import AppKit
+        import ApplicationServices
         import CoreMedia
         import Foundation
         import Quartz
@@ -186,6 +218,8 @@ class PyObjCScreenCaptureKitBackend:
         import dispatch
         import objc
 
+        self._appkit = AppKit
+        self._application_services = ApplicationServices
         self._core_media = CoreMedia
         self._foundation = Foundation
         self._quartz = Quartz
@@ -213,15 +247,32 @@ class PyObjCScreenCaptureKitBackend:
                 return self
 
             def stream_didOutputSampleBuffer_ofType_(self, _stream, sample_buffer, output_type):
-                on_sample, on_sample_error = self._callbacks
+                (
+                    on_sample,
+                    on_sample_error,
+                    source_rect,
+                    configured_global_content,
+                ) = self._callbacks
                 try:
                     with self._backend._objc.autorelease_pool():
-                        self._deliver(sample_buffer, output_type, on_sample)
+                        self._deliver(
+                            sample_buffer,
+                            output_type,
+                            on_sample,
+                            source_rect,
+                            configured_global_content,
+                        )
                 except Exception as error:
                     on_sample_error(f"ScreenCaptureKit sample conversion failed: {error}")
 
             @objc.python_method
-            def _deliver(self, sample_buffer, output_type, on_sample):
+            def _deliver(
+                    self,
+                    sample_buffer,
+                    output_type,
+                    on_sample,
+                    source_rect,
+                    configured_global_content):
                 owner = self._backend
                 screen_capture_kit = owner._screen_capture_kit
                 core_media = owner._core_media
@@ -247,6 +298,29 @@ class PyObjCScreenCaptureKitBackend:
                     screen_capture_kit.SCStreamFrameInfoScaleFactor)
                 content_scale = frame_info.get(
                     screen_capture_kit.SCStreamFrameInfoContentScale)
+                screen_rect_key = getattr(
+                    screen_capture_kit, "SCStreamFrameInfoScreenRect", None)
+                screen_rect_value = (
+                    frame_info.get(screen_rect_key)
+                    if screen_rect_key is not None else None)
+                screen_rect = None
+                global_content_geometry = configured_global_content
+                if screen_rect_value is not None:
+                    raw_screen_rect = _surface_rect(screen_rect_value)
+                    screen_rect = WindowGeometry(
+                        raw_screen_rect.x,
+                        raw_screen_rect.y,
+                        raw_screen_rect.width,
+                        raw_screen_rect.height,
+                        WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
+                    )
+                    global_content_geometry = WindowGeometry(
+                        screen_rect.x + source_rect.x,
+                        screen_rect.y + source_rect.y,
+                        source_rect.width,
+                        source_rect.height,
+                        WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
+                    )
                 metadata = StreamFrameMetadata(
                     complete=complete,
                     content_rect_points=(
@@ -255,6 +329,8 @@ class PyObjCScreenCaptureKitBackend:
                         float(scale_factor) if scale_factor is not None else None),
                     content_scale=(
                         float(content_scale) if content_scale is not None else None),
+                    screen_rect_points=screen_rect,
+                    global_content_geometry=global_content_geometry,
                 )
                 if not complete:
                     on_sample(None, 0, 0, 0, metadata)
@@ -340,20 +416,119 @@ class PyObjCScreenCaptureKitBackend:
         if selected is None:
             raise ScreenCaptureKitCaptureError(
                 "could not determine the display containing the selected window")
-        _, _, logical_width, logical_height = _rect_components(
-            _objc_value(selected, "frame"))
-        scales = []
-        if logical_width > 0:
-            scales.append(float(_objc_value(selected, "width")) / logical_width)
-        if logical_height > 0:
-            scales.append(float(_objc_value(selected, "height")) / logical_height)
-        if not scales or any(not math.isfinite(value) or value <= 0 for value in scales):
+        display_id = int(_objc_value(selected, "displayID") or 0)
+        for screen in self._appkit.NSScreen.screens():
+            description = _objc_value(screen, "deviceDescription") or {}
+            screen_number = description.get("NSScreenNumber")
+            if screen_number is None or int(screen_number) != display_id:
+                continue
+            scale = float(_objc_value(screen, "backingScaleFactor"))
+            if not math.isfinite(scale) or scale <= 0:
+                raise ScreenCaptureKitCaptureError(
+                    "selected display returned an invalid backing scale factor")
+            return scale
+        raise ScreenCaptureKitCaptureError(
+            "could not resolve the selected ScreenCaptureKit display to NSScreen")
+
+    def _ax_attribute(self, element, name: str):
+        error, value = self._application_services.AXUIElementCopyAttributeValue(
+            element, name, None)
+        return value if int(error) == 0 else None
+
+    def _ax_window_frame(self, element) -> WindowGeometry | None:
+        application_services = self._application_services
+        position = self._ax_attribute(element, "AXPosition")
+        size = self._ax_attribute(element, "AXSize")
+        if position is None or size is None:
+            return None
+        if (
+                application_services.AXValueGetType(position)
+                != application_services.kAXValueCGPointType
+                or application_services.AXValueGetType(size)
+                != application_services.kAXValueCGSizeType):
+            return None
+        position_ok, point = application_services.AXValueGetValue(
+            position, application_services.kAXValueCGPointType, None)
+        size_ok, dimensions = application_services.AXValueGetValue(
+            size, application_services.kAXValueCGSizeType, None)
+        if not position_ok or not size_ok:
+            return None
+        return WindowGeometry(
+            float(point.x),
+            float(point.y),
+            float(dimensions.width),
+            float(dimensions.height),
+        )
+
+    @staticmethod
+    def _same_rect(first: WindowGeometry, second: WindowGeometry) -> bool:
+        return all(abs(left - right) <= 0.5 for left, right in (
+            (first.x, second.x),
+            (first.y, second.y),
+            (first.width, second.width),
+            (first.height, second.height),
+        ))
+
+    def _content_region(
+            self,
+            candidate: WindowCandidate,
+            selected_window) -> tuple[WindowGeometry, WindowGeometry]:
+        """Return stream-local source points and global logical content points."""
+        outer = _surface_rect(_objc_value(selected_window, "frame"))
+        if not self._same_rect(outer, candidate.outer_geometry):
             raise ScreenCaptureKitCaptureError(
-                "selected display returned an invalid pixel-to-point scale")
-        if len(scales) == 2 and abs(scales[0] - scales[1]) > 0.01:
+                "macOS window geometry changed before capture stream creation")
+        application_services = self._application_services
+        application = application_services.AXUIElementCreateApplication(
+            candidate.process_id)
+        windows = self._ax_attribute(application, "AXWindows") or ()
+        matching = []
+        for window in windows:
+            frame = self._ax_window_frame(window)
+            if frame is None or not self._same_rect(frame, outer):
+                continue
+            title = str(self._ax_attribute(window, "AXTitle") or "").strip()
+            if candidate.title and title and title != candidate.title.strip():
+                continue
+            matching.append(window)
+        if len(matching) != 1:
             raise ScreenCaptureKitCaptureError(
-                "selected display returned inconsistent horizontal/vertical scale")
-        return sum(scales) / len(scales)
+                "Accessibility permission and one matching AXWindow are required "
+                "for content-only capture")
+
+        ax_window = matching[0]
+        subrole = str(self._ax_attribute(ax_window, "AXSubrole") or "")
+        if subrole != "AXStandardWindow":
+            raise ScreenCaptureKitCaptureError(
+                f"unsupported macOS window subrole for content-only capture: "
+                f"{subrole or 'unknown'}")
+        if self._ax_attribute(ax_window, "AXTitleUIElement") is None:
+            raise ScreenCaptureKitCaptureError(
+                "unsupported macOS window without a verifiable standard title bar")
+        content = self._appkit.NSWindow.contentRectForFrameRect_styleMask_(
+            self._appkit.NSMakeRect(0, 0, outer.width, outer.height),
+            self._appkit.NSWindowStyleMaskTitled,
+        )
+        content_x, content_y, content_width, content_height = _rect_components(
+            content)
+        top_inset = outer.height - content_y - content_height
+        local = WindowGeometry(
+            content_x,
+            top_inset,
+            content_width,
+            content_height,
+        )
+        if local.width <= 0 or local.height <= 0:
+            raise ScreenCaptureKitCaptureError(
+                "macOS window returned an invalid content rectangle")
+        global_content = WindowGeometry(
+            outer.x + local.x,
+            outer.y + local.y,
+            local.width,
+            local.height,
+            WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
+        )
+        return local, global_content
 
     def start_stream(
             self,
@@ -386,15 +561,31 @@ class PyObjCScreenCaptureKitBackend:
         screen_capture_kit = self._screen_capture_kit
         configuration = screen_capture_kit.SCStreamConfiguration.alloc().init()
         scale = self._display_scale(content, selected_window)
-        _, _, logical_width, logical_height = _rect_components(
-            _objc_value(selected_window, "frame"))
-        configuration.setWidth_(max(1, round(logical_width * scale)))
-        configuration.setHeight_(max(1, round(logical_height * scale)))
+        source_rect, global_content_geometry = self._content_region(
+            candidate, selected_window)
+        output_width = max(1, round(source_rect.width * scale))
+        output_height = max(1, round(source_rect.height * scale))
+        configuration.setWidth_(output_width)
+        configuration.setHeight_(output_height)
+        configuration.setSourceRect_(self._quartz.CGRectMake(
+            source_rect.x,
+            source_rect.y,
+            source_rect.width,
+            source_rect.height,
+        ))
+        if hasattr(configuration, "setDestinationRect_"):
+            configuration.setDestinationRect_(
+                self._quartz.CGRectMake(0, 0, output_width, output_height))
         configuration.setPixelFormat_(self._quartz.kCVPixelFormatType_32BGRA)
         configuration.setMinimumFrameInterval_(
             self._core_media.CMTimeMake(1, frames_per_second))
         configuration.setQueueDepth_(3)
         configuration.setShowsCursor_(False)
+        # ``Best`` returns the nominal 1x content buffer for the official
+        # client's HiDPI window on current macOS. ``Automatic`` honors the
+        # explicitly configured 2x output surface (1920x1080 for 960x540
+        # logical content) while remaining available on older runtimes.
+        _request_automatic_capture_resolution(configuration, screen_capture_kit)
         if hasattr(configuration, "setCapturesAudio_"):
             configuration.setCapturesAudio_(False)
         if hasattr(configuration, "setScalesToFit_"):
@@ -406,7 +597,12 @@ class PyObjCScreenCaptureKitBackend:
             selected_window)
         delegate = self._delegate_class.alloc().initWithCallback_(on_stopped)
         output = self._output_class.alloc().initWithBackend_callbacks_(
-            self, (on_sample, on_sample_error))
+            self, (
+                on_sample,
+                on_sample_error,
+                source_rect,
+                global_content_geometry,
+            ))
         stream = screen_capture_kit.SCStream.alloc().initWithFilter_configuration_delegate_(
             content_filter, configuration, delegate)
         queue = self._dispatch.dispatch_queue_create(
@@ -510,7 +706,11 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
         self._synchronize_stream()
 
     def _permission_status(self):
-        return self.permission_service.status(PermissionKind.SCREEN_RECORDING)
+        statuses = tuple(self.permission_service.status(kind) for kind in (
+            PermissionKind.SCREEN_RECORDING,
+            PermissionKind.ACCESSIBILITY,
+        ))
+        return next((status for status in statuses if not status.granted), statuses[0])
 
     def _set_unavailable(self, state: CaptureStreamState, detail: str) -> None:
         with self._state_lock:
@@ -609,7 +809,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 self._set_unavailable(
                     state,
                     permission.detail or (
-                        f"{permission.state.value}: grant Screen Recording at "
+                        f"{permission.state.value}: grant {permission.kind.value} at "
                         f"{permission.settings_path}"),
                 )
                 stop_error = self._stop_binding(stream)
@@ -618,6 +818,10 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 return
 
             try:
+                with self._state_lock:
+                    refresh_for_rebuild = self._needs_rebuild
+                if refresh_for_rebuild:
+                    self.target.refresh()
                 target_exists = bool(self.target.exists())
             except Exception as error:
                 stream = self._detach_stream() if self._stream is not None else None
@@ -698,6 +902,19 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 )
             except Exception as error:
                 detail = str(error)
+                permission = self._permission_status()
+                if not permission.granted:
+                    state = (
+                        CaptureStreamState.PERMISSION_REVOKED
+                        if permission.state.value == "permission-revoked"
+                        else CaptureStreamState.PERMISSION_REQUIRED)
+                    self._set_unavailable(
+                        state,
+                        permission.detail or (
+                            f"{permission.state.value}: grant "
+                            f"{permission.kind.value} at {permission.settings_path}"),
+                    )
+                    return
                 self._set_fatal(
                     detail,
                     blocked_generation=snapshot.generation,
@@ -764,11 +981,15 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 bytes_per_row=bytes_per_row,
                 crop=crop,
             )
-            global_content = candidate.content_geometry or candidate.outer_geometry
+            global_content = (
+                metadata.global_content_geometry
+                or candidate.content_geometry
+                or candidate.outer_geometry)
             geometry = CaptureGeometry(
                 target_generation=target_snapshot.generation,
                 capture_generation=capture_generation,
-                outer_geometry=candidate.outer_geometry,
+                outer_geometry=(
+                    metadata.screen_rect_points or candidate.outer_geometry),
                 global_content_geometry=global_content,
                 raw_frame_width=width,
                 raw_frame_height=height,
@@ -784,6 +1005,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 crop,
                 display_scale,
                 metadata.content_scale,
+                metadata.screen_rect_points,
                 global_content,
             )
         except Exception as error:

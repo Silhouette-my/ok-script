@@ -10,6 +10,9 @@ from ok.device.capture_methods.screencapturekit import (
     PyObjCScreenCaptureKitBackend,
     ScreenCaptureKitCaptureMethod,
     ScreenCaptureKitCaptureError,
+    _rect_components,
+    _request_automatic_capture_resolution,
+    _surface_rect,
     _with_locked_bgra_pixel_buffer,
 )
 from ok.device.capture_methods.screencapturekit_core import StreamFrameMetadata
@@ -24,6 +27,167 @@ from ok.task.exceptions import CaptureException
 
 
 MAC_POINTS = WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS
+
+
+def test_rect_components_accepts_pyobjc_cgrect_dictionary_bridge():
+    bridged_rect = {"X": 0, "Y": 1.5, "Width": 480, "Height": 284}
+
+    assert _rect_components(bridged_rect) == (0.0, 1.5, 480.0, 284.0)
+    assert _surface_rect(bridged_rect) == WindowGeometry(0, 1.5, 480, 284)
+
+
+def test_automatic_capture_resolution_uses_typed_api_when_available():
+    calls = []
+    typed = SimpleNamespace(setCaptureResolution_=lambda value: calls.append(("typed", value)))
+    assert _request_automatic_capture_resolution(
+        typed, SimpleNamespace(SCCaptureResolutionAutomatic=0))
+    assert calls == [("typed", 0)]
+
+    assert not _request_automatic_capture_resolution(SimpleNamespace(), SimpleNamespace())
+
+
+def test_stream_metadata_rejects_non_global_content_geometry():
+    with pytest.raises(ValueError, match="macOS logical points"):
+        StreamFrameMetadata(
+            True,
+            global_content_geometry=WindowGeometry(0, 0, 10, 10),
+        )
+    with pytest.raises(ValueError, match="screen_rect_points"):
+        StreamFrameMetadata(
+            True,
+            screen_rect_points=WindowGeometry(0, 0, 10, 10),
+        )
+
+
+class FakeAXValue:
+    def __init__(self, value, value_type):
+        self.value = value
+        self.value_type = value_type
+
+
+class FakeApplicationServices:
+    kAXValueCGPointType = 1
+    kAXValueCGSizeType = 2
+
+    def __init__(self, attributes):
+        self.attributes = attributes
+
+    def AXUIElementCreateApplication(self, process_id):
+        assert process_id == 10
+        return "application"
+
+    def AXUIElementCopyAttributeValue(self, element, name, _value):
+        key = (element, name)
+        if key not in self.attributes:
+            return -25205, None
+        return 0, self.attributes[key]
+
+    def AXValueGetType(self, value):
+        return value.value_type if isinstance(value, FakeAXValue) else 0
+
+    def AXValueGetValue(self, value, value_type, _result):
+        assert value_type == value.value_type
+        return True, value.value
+
+
+class FakeAppKit:
+    NSWindowStyleMaskTitled = 1
+
+    class NSWindow:
+        @staticmethod
+        def contentRectForFrameRect_styleMask_(frame, style_mask):
+            assert frame == ((0, 0), (960, 568))
+            assert style_mask == FakeAppKit.NSWindowStyleMaskTitled
+            return ((0, 0), (960, 540))
+
+    @staticmethod
+    def NSMakeRect(x, y, width, height):
+        return ((x, y), (width, height))
+
+
+def test_content_region_uses_ax_standard_window_and_top_origin_source_rect():
+    backend = object.__new__(PyObjCScreenCaptureKitBackend)
+    backend._appkit = FakeAppKit
+    backend._application_services = FakeApplicationServices({
+        ("application", "AXWindows"): ("window",),
+        ("window", "AXPosition"): FakeAXValue(
+            SimpleNamespace(x=0, y=213),
+            FakeApplicationServices.kAXValueCGPointType,
+        ),
+        ("window", "AXSize"): FakeAXValue(
+            SimpleNamespace(width=960, height=568),
+            FakeApplicationServices.kAXValueCGSizeType,
+        ),
+        ("window", "AXTitle"): "鸣潮  ",
+        ("window", "AXSubrole"): "AXStandardWindow",
+        ("window", "AXTitleUIElement"): "title-bar",
+    })
+    selected_window = SimpleNamespace(frame=lambda: ((0, 213), (960, 568)))
+    selected = WindowCandidate(
+        process_id=10,
+        window_id=20,
+        bundle_identifier="com.example.game",
+        application_name="Example Game",
+        title="鸣潮",
+        layer=0,
+        outer_geometry=WindowGeometry(0, 213, 960, 568, MAC_POINTS),
+    )
+
+    local, global_content = backend._content_region(selected, selected_window)
+
+    assert local == WindowGeometry(0, 28, 960, 540)
+    assert global_content == WindowGeometry(0, 241, 960, 540, MAC_POINTS)
+
+
+def test_content_region_fails_closed_when_ax_window_is_not_unique():
+    backend = object.__new__(PyObjCScreenCaptureKitBackend)
+    backend._application_services = FakeApplicationServices({
+        ("application", "AXWindows"): (),
+    })
+    selected_window = SimpleNamespace(frame=lambda: ((0, 213), (960, 568)))
+    selected = WindowCandidate(
+        process_id=10,
+        window_id=20,
+        bundle_identifier="com.example.game",
+        application_name="Example Game",
+        title="鸣潮",
+        layer=0,
+        outer_geometry=WindowGeometry(0, 213, 960, 568, MAC_POINTS),
+    )
+
+    with pytest.raises(ScreenCaptureKitCaptureError, match="Accessibility permission"):
+        backend._content_region(selected, selected_window)
+
+
+def test_content_region_fails_closed_without_verifiable_title_bar():
+    backend = object.__new__(PyObjCScreenCaptureKitBackend)
+    backend._appkit = FakeAppKit
+    backend._application_services = FakeApplicationServices({
+        ("application", "AXWindows"): ("window",),
+        ("window", "AXPosition"): FakeAXValue(
+            SimpleNamespace(x=0, y=213),
+            FakeApplicationServices.kAXValueCGPointType,
+        ),
+        ("window", "AXSize"): FakeAXValue(
+            SimpleNamespace(width=960, height=568),
+            FakeApplicationServices.kAXValueCGSizeType,
+        ),
+        ("window", "AXTitle"): "鸣潮",
+        ("window", "AXSubrole"): "AXStandardWindow",
+    })
+    selected_window = SimpleNamespace(frame=lambda: ((0, 213), (960, 568)))
+    selected = WindowCandidate(
+        process_id=10,
+        window_id=20,
+        bundle_identifier="com.example.game",
+        application_name="Example Game",
+        title="鸣潮",
+        layer=0,
+        outer_geometry=WindowGeometry(0, 213, 960, 568, MAC_POINTS),
+    )
+
+    with pytest.raises(ScreenCaptureKitCaptureError, match="standard title bar"):
+        backend._content_region(selected, selected_window)
 
 
 def candidate(*, width=12, content_geometry=None):
@@ -43,24 +207,35 @@ class FakeTarget:
     def __init__(self):
         self.snapshot = WindowTargetSnapshot(candidate(), 1, True)
         self.alive = True
+        self.refresh_calls = 0
 
     def exists(self):
         return self.alive
 
+    def refresh(self):
+        self.refresh_calls += 1
+
 
 class FakePermissionService:
-    def __init__(self, state=PermissionState.GRANTED):
+    def __init__(
+            self,
+            state=PermissionState.GRANTED,
+            accessibility_state=PermissionState.GRANTED):
         self.state = state
+        self.accessibility_state = accessibility_state
         self.calls = 0
 
     def status(self, kind):
-        assert kind is PermissionKind.SCREEN_RECORDING
         self.calls += 1
+        state = (
+            self.state
+            if kind is PermissionKind.SCREEN_RECORDING
+            else self.accessibility_state)
         return PermissionStatus(
             kind,
-            self.state,
-            self.state is not PermissionState.GRANTED,
-            'System Settings > Privacy & Security > Screen Recording',
+            state,
+            state is not PermissionState.GRANTED,
+            f'System Settings > Privacy & Security > {kind.value}',
         )
 
 
@@ -175,6 +350,7 @@ def test_content_rect_crops_title_bar_or_surface_padding_and_tracks_geometry():
         content_rect_points=WindowGeometry(1, 1, 11, 11),
         display_scale=1.0,
         content_scale=1.0,
+        global_content_geometry=WindowGeometry(110, 230, 11, 11, MAC_POINTS),
     )
     backend.publish(raw, metadata=metadata)
 
@@ -231,6 +407,41 @@ def test_scale_or_stream_geometry_change_discards_frame_and_rebuilds():
     diagnostics = capture.diagnostics()
     assert diagnostics.geometry_invalidations == 1
     assert diagnostics.rebuilds == 1
+
+
+def test_window_move_screen_rect_discards_old_geometry_and_refreshes_target():
+    target = FakeTarget()
+    backend = FakeBackend()
+    capture = make_capture(target=target, backend=backend)
+    original_outer = target.snapshot.candidate.outer_geometry
+    backend.publish(
+        sample(1),
+        metadata=StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 12, 12),
+            display_scale=1.0,
+            screen_rect_points=original_outer,
+            global_content_geometry=original_outer,
+        ),
+    )
+    assert capture.get_frame() is not None
+
+    moved_outer = WindowGeometry(140, 240, 12, 12, MAC_POINTS)
+    backend.publish(
+        sample(2),
+        metadata=StreamFrameMetadata(
+            True,
+            content_rect_points=WindowGeometry(0, 0, 12, 12),
+            display_scale=1.0,
+            screen_rect_points=moved_outer,
+            global_content_geometry=moved_outer,
+        ),
+    )
+
+    assert capture.get_frame() is None
+    assert target.refresh_calls == 1
+    assert len(backend.starts) == 2
+    assert len(backend.stops) == 1
 
 
 def test_stop_failure_is_fatal_and_does_not_start_a_second_stream():
@@ -323,6 +534,38 @@ def test_missing_or_revoked_permission_is_explicit_and_does_not_retry(state, exp
 
     assert backend.starts == []
     assert capture.diagnostics().state is expected_state
+
+
+def test_missing_accessibility_permission_is_actionable_and_does_not_start_stream():
+    permission = FakePermissionService(
+        accessibility_state=PermissionState.REQUIRED)
+    backend = FakeBackend()
+    capture = make_capture(permission=permission, backend=backend)
+
+    with pytest.raises(CaptureException, match='accessibility'):
+        capture.get_frame()
+
+    assert backend.starts == []
+    assert capture.diagnostics().state is CaptureStreamState.PERMISSION_REQUIRED
+
+
+def test_accessibility_revoked_during_start_is_not_misreported_as_fatal():
+    class RevokingPermission(FakePermissionService):
+        def status(self, kind):
+            if self.calls >= 2 and kind is PermissionKind.ACCESSIBILITY:
+                self.accessibility_state = PermissionState.REVOKED
+            return super().status(kind)
+
+    permission = RevokingPermission()
+    backend = FakeBackend()
+    backend.fail_start = 'AX access disappeared during stream start'
+    capture = make_capture(permission=permission, backend=backend)
+
+    with pytest.raises(CaptureException, match='accessibility'):
+        capture.get_frame()
+
+    assert capture.diagnostics().state is CaptureStreamState.PERMISSION_REVOKED
+    assert backend.starts == []
 
 
 def test_permission_revocation_after_start_stops_stream_and_clears_frame():
@@ -473,17 +716,22 @@ def test_close_is_idempotent_and_rejects_late_callbacks():
     assert capture.get_frame() is None
 
 
-def test_display_scale_uses_pixels_over_points_for_selected_display():
+def test_display_scale_uses_matching_nsscreen_backing_scale_factor():
     backend = object.__new__(PyObjCScreenCaptureKitBackend)
     display = SimpleNamespace(
         frame=lambda: ((0, 0), (100, 80)),
-        width=lambda: 150,
-        height=lambda: 120,
+        displayID=lambda: 7,
     )
+    screen = SimpleNamespace(
+        deviceDescription=lambda: {"NSScreenNumber": 7},
+        backingScaleFactor=lambda: 2.0,
+    )
+    backend._appkit = SimpleNamespace(
+        NSScreen=SimpleNamespace(screens=lambda: (screen,)))
     content = SimpleNamespace(displays=lambda: (display,))
     window = SimpleNamespace(frame=lambda: ((10, 10), (50, 40)))
 
-    assert backend._display_scale(content, window) == 1.5
+    assert backend._display_scale(content, window) == 2.0
     with pytest.raises(ScreenCaptureKitCaptureError, match='display containing'):
         backend._display_scale(
             SimpleNamespace(displays=lambda: (display,)),
