@@ -7,6 +7,9 @@ This repository owns the reusable platform layer for the OK-WW **macOS foregroun
 Before changing macOS-related platform code, read:
 
 - `docs/development/macos-foreground-platform-constraints.md`
+- `docs/development/macos-stage1-platform-inventory.md`
+- `docs/development/macos-integration-sync-and-rollback.md`
+- `docs/development/decisions/README.md`
 - the companion OK-WW `MACOS_ENGINEERING_CONSTRAINTS.md`
 - the companion implementation plan at `docs/development/macos-foreground-port-plan.md`
 - applicable repository skills under `.agents/skills/`
