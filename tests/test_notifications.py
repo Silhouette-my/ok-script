@@ -195,7 +195,7 @@ def test_manager_uses_context_menu_images_for_qq():
         stop_event=SimpleNamespace(is_set=lambda: False))
     manager.app_name = 'Test App'
 
-    with patch('ok.notification.manager.MessengerAutomation') as automation:
+    with patch('ok.notification.windows_messenger.MessengerAutomation') as automation:
         manager._send('Title', 'Message', [np.zeros((2, 2, 3), dtype=np.uint8)])
 
     assert automation.call_args.kwargs['image_method'] == 'context_menu'
