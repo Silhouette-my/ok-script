@@ -116,6 +116,8 @@ class DeviceManager:
         self.cursor_service = create_cursor_service()
         self.global_config = global_config
         self._adb_lock = threading.Lock()
+        self._device_lifecycle_lock = threading.RLock()
+        self._closing = False
         if app_config.get('adb'):
             self.packages = app_config.get('adb').get('packages')
         else:
@@ -214,7 +216,26 @@ class DeviceManager:
                 kill_exe(abs_path=self.hwnd_window.exe_full_path)
 
     def close(self):
-        """Stop capture resources before Qt/Python teardown begins."""
+        """Block/release input before capture and Qt/Python teardown."""
+        lock = getattr(self, '_device_lifecycle_lock', None)
+        if lock is None:
+            return self._close_locked()
+        with lock:
+            self._closing = True
+            return self._close_locked()
+
+    def _close_locked(self):
+        interaction = self.interaction
+        if interaction is not None:
+            try:
+                interaction.on_destroy()
+            except Exception as e:
+                logger.error(f'interaction close failed: {e}')
+                try:
+                    interaction.invalidate('device manager closing', shutdown=True)
+                except Exception as invalidate_error:
+                    logger.error(f'interaction invalidation failed: {invalidate_error}')
+        self.interaction = None
         hwnd_window = self.hwnd_window
         if hwnd_window is not None:
             hwnd_window.stop()
@@ -306,10 +327,33 @@ class DeviceManager:
         return self.permission_service.request(kind)
 
     def _invalidate_macos_capture(self, reason):
+        self._invalidate_macos_input(reason)
         capture_method = getattr(self, 'capture_method', None)
         invalidator = getattr(capture_method, 'invalidate', None)
         if callable(invalidator):
             invalidator(reason)
+
+    def _invalidate_macos_input(self, reason):
+        interaction = getattr(self, 'interaction', None)
+        invalidator = getattr(interaction, 'invalidate', None)
+        if callable(invalidator):
+            invalidator(reason)
+
+    def _on_macos_capture_input_invalidated(self, capture, reason):
+        """Ignore callbacks from a capture provider that has been replaced."""
+        if capture is self.capture_method:
+            self._invalidate_macos_input(reason)
+
+    def _on_macos_interaction_invalidated(self, reason):
+        """Pause automation after a foreground/input safety gate closes."""
+        logger.error(f'macOS foreground automation paused: {reason}')
+        executor = getattr(self, 'executor', None)
+        exit_event = getattr(self, 'exit_event', None)
+        if executor is None or (exit_event is not None and exit_event.is_set()):
+            return
+        pause = getattr(executor, 'pause', None)
+        if callable(pause):
+            pause()
 
     def macos_capture_diagnostics(self):
         capture_method = getattr(self, 'capture_method', None)
@@ -795,7 +839,7 @@ class DeviceManager:
         if kind == 'adb':
             return ['ADBInteraction']
         if kind == 'macos':
-            return []
+            return ['QuartzForegroundInteraction']
         return ['Default Interaction']
 
     def set_hwnd_name(self, hwnd_name):
@@ -872,6 +916,17 @@ class DeviceManager:
         self.handler.post(self.do_start, remove_existing=True, skip_if_running=True)
 
     def do_start(self, notify=True):
+        lock = getattr(self, '_device_lifecycle_lock', None)
+        if lock is None:
+            return self._do_start_locked(notify)
+        with lock:
+            exit_event = getattr(self, 'exit_event', None)
+            if self._closing or (exit_event is not None and exit_event.is_set()):
+                logger.info('skip device start while closing')
+                return
+            return self._do_start_locked(notify)
+
+    def _do_start_locked(self, notify=True):
         logger.debug(f'do_start')
         preferred = self.get_preferred_device()
         if preferred is None:
@@ -900,6 +955,7 @@ class DeviceManager:
         elif preferred['device'] == 'macos':
             require_platform('macOS desktop device', (MACOS,))
             from ok.device.capture_methods import ScreenCaptureKitCaptureMethod
+            from ok.device.interaction_methods import QuartzForegroundInteraction
             target_available = bool(
                 self.window_target is not None and self.window_target.exists())
             if target_available:
@@ -914,11 +970,31 @@ class DeviceManager:
                         self.exit_event,
                         self.window_target,
                         self.permission_service,
+                        on_input_invalidated=self._on_macos_capture_input_invalidated,
                     )
-            elif self.capture_method is not None:
-                self.capture_method.close()
+                if (
+                        not isinstance(self.interaction, QuartzForegroundInteraction)
+                        or self.interaction.capture is not self.capture_method
+                        or self.interaction.target is not self.window_target):
+                    if self.interaction is not None:
+                        destroy = getattr(self.interaction, 'on_destroy', None)
+                        if callable(destroy):
+                            destroy()
+                    self.interaction = QuartzForegroundInteraction(
+                        self.capture_method,
+                        self.window_target,
+                        self.permission_service,
+                        exit_event=self.exit_event,
+                        on_invalidated=self._on_macos_interaction_invalidated,
+                    )
+                    self.cursor_service = self.interaction.cursor_service
+            else:
+                self._invalidate_macos_input('selected macOS target is unavailable')
+                if self.capture_method is not None:
+                    self.capture_method.close()
                 self.capture_method = None
-            self.interaction = None
+                self.interaction = None
+                self.cursor_service = create_cursor_service()
             preferred['target_bound'] = bool(
                 self.window_target is not None and self.window_target.exists())
             preferred['connected'] = bool(
@@ -930,8 +1006,8 @@ class DeviceManager:
             preferred['capture_state'] = (
                 getattr(capture_state, 'value', None) or 'unavailable')
             logger.info(
-                'macOS Stage D capture state: '
-                f'{capture_diagnostics}; input remains unavailable')
+                'macOS capture/input state: '
+                f'{capture_diagnostics}; capabilities={self.capabilities.enabled_names()}')
         elif preferred['device'] == 'browser':
             if not isinstance(self.capture_method, BrowserCaptureMethod):
                 if self.capture_method is not None:

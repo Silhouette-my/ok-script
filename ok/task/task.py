@@ -1392,6 +1392,12 @@ class BaseTask(OCR):
 
     def disable(self):
         self._enabled = False
+        release_all = getattr(self.executor.interaction, 'release_all', None)
+        if callable(release_all):
+            try:
+                release_all()
+            except Exception as error:
+                self.logger.error(f'interaction release failed while disabling task: {error}')
         self.executor.remove_onetime_task(self)
         self.executor._wake_executor()
         communicate.task.emit(self)

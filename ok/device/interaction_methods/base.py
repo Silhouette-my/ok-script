@@ -58,5 +58,13 @@ class BaseInteraction:
     def scroll(self, x, y, scroll_amount):
         pass
 
+    def release_all(self):
+        """Best-effort release hook for providers that track held input."""
+        pass
+
+    def invalidate(self, reason="input-invalidated", *, shutdown=False):
+        """Close an input gate when the provider has one."""
+        del reason, shutdown
+
     def on_destroy(self):
         pass

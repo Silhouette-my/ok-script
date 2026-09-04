@@ -627,6 +627,13 @@ class TaskExecutor:
 
     def stop(self):
         logger.info('stop')
+        interaction = self.interaction
+        invalidator = getattr(interaction, 'invalidate', None)
+        if callable(invalidator):
+            try:
+                invalidator('executor stop')
+            except Exception as error:
+                logger.error(f'interaction stop invalidation failed: {error}')
         self.exit_event.set()
         self._wake_executor()
 

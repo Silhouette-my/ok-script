@@ -27,8 +27,10 @@ from ok.device.window_target.base import (
     WindowTargetSnapshot,
 )
 from ok.platform import MACOS, require_platform
+from ok.util.logger import Logger
 
 
+logger = Logger.get_logger(__name__)
 _PYOBJC_OUTPUT_CLASS = None
 _PYOBJC_DELEGATE_CLASS = None
 
@@ -668,7 +670,8 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             backend: ScreenCaptureKitBackend | None = None,
             frames_per_second: int = 30,
             lifecycle_timeout: float = 10.0,
-            monotonic: Callable[[], float] = time.monotonic):
+            monotonic: Callable[[], float] = time.monotonic,
+            on_input_invalidated: Callable[[object, str], None] | None = None):
         super().__init__()
         if frames_per_second <= 0:
             raise ValueError("frames_per_second must be positive")
@@ -681,6 +684,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
         self.frames_per_second = frames_per_second
         self.lifecycle_timeout = lifecycle_timeout
         self._monotonic = monotonic
+        self._on_input_invalidated = on_input_invalidated
         self._slot = LatestFrameSlot()
         self._state_lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -712,6 +716,15 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
         ))
         return next((status for status in statuses if not status.granted), statuses[0])
 
+    def _notify_input_invalidated(self, detail: str) -> None:
+        callback = self._on_input_invalidated
+        if callback is None:
+            return
+        try:
+            callback(self, detail)
+        except Exception as error:
+            logger.error(f"capture input-invalidation callback failed: {error}")
+
     def _set_unavailable(self, state: CaptureStreamState, detail: str) -> None:
         with self._state_lock:
             self._state = state
@@ -722,6 +735,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             self._frame_times.clear()
             self._size = (0, 0)
         self._slot.clear()
+        self._notify_input_invalidated(detail)
 
     def _detach_stream(self):
         with self._state_lock:
@@ -776,6 +790,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             self._frame_times.clear()
             self._size = (0, 0)
         self._slot.clear()
+        self._notify_input_invalidated(detail)
         return True
 
     def invalidate(self, reason: str = "capture-invalidated") -> None:
@@ -790,6 +805,8 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             stop_error = self._stop_binding(stream)
             if stop_error is not None:
                 self._set_fatal(stop_error)
+            else:
+                self._notify_input_invalidated(reason)
 
     def _synchronize_stream(self) -> None:
         with self._lifecycle_lock:
@@ -1059,9 +1076,15 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 return
             self._conversion_errors += 1
             self._last_error = detail
+            self._latest_geometry = None
+            self._geometry_signature = None
+            self._latest_frame_time = None
+            self._frame_times.clear()
+            self._size = (0, 0)
         # Never let a consumer unknowingly reuse an older frame after the
         # current complete sample could not be normalized safely.
         self._slot.clear()
+        self._notify_input_invalidated(detail)
 
     def _on_stream_stopped(self, capture_generation: int, detail: str) -> None:
         self._set_fatal(
@@ -1151,6 +1174,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             )
 
     def close(self):
+        self._notify_input_invalidated("ScreenCaptureKit capture closed")
         with self._lifecycle_lock:
             with self._state_lock:
                 if self._state is CaptureStreamState.CLOSED:

@@ -1,4 +1,5 @@
 import unittest
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -53,6 +54,85 @@ class TestDeviceManagerInteractionSelection(unittest.TestCase):
         self.assertEqual('ADBInteraction', manager.config['interaction'])
         self.assertIsNone(manager.win_interaction_class)
         manager.start.assert_called_once_with()
+
+    def test_close_invalidates_input_before_capture(self):
+        calls = []
+        interaction = Mock()
+        manager = DeviceManager.__new__(DeviceManager)
+
+        def destroy():
+            self.assertIs(manager.interaction, interaction)
+            calls.append(("destroy",))
+
+        interaction.on_destroy.side_effect = destroy
+        capture = Mock()
+        capture.close.side_effect = lambda: calls.append(("capture",))
+        manager.interaction = interaction
+        manager.capture_method = capture
+        manager.hwnd_window = None
+
+        manager.close()
+
+        self.assertEqual(
+            [
+                ("destroy",),
+                ("capture",),
+            ],
+            calls,
+        )
+        self.assertIsNone(manager.interaction)
+        self.assertIsNone(manager.capture_method)
+
+    def test_macos_input_invalidation_pauses_executor_with_gate_closed(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.executor = Mock()
+        manager.exit_event = Mock()
+        manager.exit_event.is_set.return_value = False
+
+        manager._on_macos_interaction_invalidated("game lost focus")
+
+        manager.executor.pause.assert_called_once_with()
+
+    def test_close_fallback_permanently_shuts_down_failed_interaction(self):
+        interaction = Mock()
+        interaction.on_destroy.side_effect = RuntimeError("destroy failed")
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.interaction = interaction
+        manager.capture_method = None
+        manager.hwnd_window = None
+
+        manager.close()
+
+        interaction.invalidate.assert_called_once_with(
+            "device manager closing", shutdown=True)
+
+    def test_do_start_is_rejected_after_close_begins(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        manager._device_lifecycle_lock = threading.RLock()
+        manager._closing = True
+        manager.exit_event = Mock()
+        manager.exit_event.is_set.return_value = False
+        manager._do_start_locked = Mock()
+
+        manager.do_start(notify=False)
+
+        manager._do_start_locked.assert_not_called()
+
+    def test_replaced_macos_capture_cannot_invalidate_new_interaction(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        current_capture = object()
+        replaced_capture = object()
+        manager.capture_method = current_capture
+        manager.interaction = Mock()
+
+        manager._on_macos_capture_input_invalidated(
+            replaced_capture, "late old-stream callback")
+        manager.interaction.invalidate.assert_not_called()
+
+        manager._on_macos_capture_input_invalidated(
+            current_capture, "current stream stopped")
+        manager.interaction.invalidate.assert_called_once_with(
+            "current stream stopped")
 
 
 class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
@@ -129,11 +209,14 @@ class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
         self.assertFalse(manager.device_dict['macos']['target_bound'])
         discovery.bind.assert_not_called()
 
-    def test_macos_device_starts_capture_but_keeps_interaction_unavailable(self):
+    def test_macos_device_starts_capture_and_foreground_interaction(self):
         class FakeCapture:
-            def __init__(self, _exit_event, target, _permission_service):
+            def __init__(
+                    self, _exit_event, target, _permission_service,
+                    on_input_invalidated=None):
                 self.target = target
                 self.closed = False
+                self.on_input_invalidated = on_input_invalidated
 
             def close(self):
                 self.closed = True
@@ -143,6 +226,23 @@ class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
 
             def diagnostics(self):
                 return SimpleNamespace(state=SimpleNamespace(value='running'))
+
+        class FakeInteraction:
+            def __init__(
+                    self, capture, target, _permission_service,
+                    *, exit_event=None, on_invalidated=None):
+                self.capture = capture
+                self.target = target
+                self.exit_event = exit_event
+                self.on_invalidated = on_invalidated
+                self.cursor_service = SimpleNamespace(available=True)
+
+            def get_capabilities(self):
+                from ok.device.capabilities import DeviceCapabilities
+                return DeviceCapabilities(keyboard_tap=True, foreground_only=True)
+
+            def on_destroy(self):
+                pass
 
         manager = DeviceManager.__new__(DeviceManager)
         manager.macos_window_config = {'title_patterns': ['Game']}
@@ -163,22 +263,32 @@ class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
         manager.capture_method = Mock()
         previous_capture = manager.capture_method
         manager.interaction = object()
+        manager.cursor_service = SimpleNamespace(available=False)
 
         with (
                 patch('ok.device.DeviceManager.require_platform'),
                 patch(
                     'ok.device.capture_methods.ScreenCaptureKitCaptureMethod',
                     FakeCapture),
+                patch(
+                    'ok.device.interaction_methods.QuartzForegroundInteraction',
+                    FakeInteraction),
         ):
             manager.do_start(notify=False)
 
         previous_capture.close.assert_called_once_with()
         self.assertIsInstance(manager.capture_method, FakeCapture)
-        self.assertIsNone(manager.interaction)
+        self.assertIsInstance(manager.interaction, FakeInteraction)
+        self.assertIs(manager.cursor_service, manager.interaction.cursor_service)
+        self.assertIs(
+            manager.capture_method.on_input_invalidated.__self__, manager)
         self.assertTrue(manager.device_dict['macos']['target_bound'])
         self.assertTrue(manager.device_dict['macos']['connected'])
         self.assertEqual(['ScreenCaptureKit'], manager.available_capture_methods())
-        self.assertEqual([], manager.available_interaction_methods())
+        self.assertEqual(
+            ['QuartzForegroundInteraction'],
+            manager.available_interaction_methods(),
+        )
         self.assertTrue(manager.device_connected())
 
         manager.window_target.exists.return_value = False

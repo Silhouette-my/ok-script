@@ -169,12 +169,12 @@ def test_device_manager_does_not_construct_windows_providers(monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='Non-Windows cursor boundary check')
-def test_cursor_service_is_explicitly_unavailable_before_quartz_backend():
+def test_cursor_service_is_explicitly_unavailable_before_bound_quartz_backend():
     from ok.device.services import create_cursor_service
 
     service = create_cursor_service()
     assert not service.available
-    with pytest.raises(PlatformUnavailableError, match='Stage 5'):
+    with pytest.raises(PlatformUnavailableError, match='bound Quartz foreground'):
         service.get_position()
 
 

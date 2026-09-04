@@ -15,7 +15,7 @@ from ok.device.interaction_methods.keys import (
     normalize_pydirect_key,
 )
 from ok.device.interaction_methods.swipe import insert_swipe
-from ok.platform import WINDOWS, require_platform
+from ok.platform import MACOS, WINDOWS, require_platform
 
 
 _COMMON_EXPORTS = [
@@ -44,16 +44,29 @@ _WINDOWS_EXPORTS = {
     'vk_key_dict': ('ok.device.interaction_methods.windows_keys', 'vk_key_dict'),
 }
 
+_MACOS_EXPORTS = {
+    'QuartzForegroundInteraction': (
+        'ok.device.interaction_methods.quartz', 'QuartzForegroundInteraction'),
+}
+
 __all__ = list(_COMMON_EXPORTS)
 if sys.platform == WINDOWS:
     __all__.extend(_WINDOWS_EXPORTS)
+elif sys.platform == MACOS:
+    __all__.extend(_MACOS_EXPORTS)
 
 
 def __getattr__(name):
     target = _WINDOWS_EXPORTS.get(name)
+    platform = WINDOWS
+    platform_label = 'Windows'
+    if target is None:
+        target = _MACOS_EXPORTS.get(name)
+        platform = MACOS
+        platform_label = 'macOS'
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    require_platform(f'Windows interaction export {name}', (WINDOWS,))
+    require_platform(f'{platform_label} interaction export {name}', (platform,))
     module_name, attribute_name = target
     value = getattr(importlib.import_module(module_name), attribute_name)
     globals()[name] = value

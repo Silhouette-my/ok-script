@@ -1,8 +1,7 @@
 """Platform-neutral cursor service selection.
 
-Stage 2 exposes the service boundary and preserves the Windows implementation.
-The production macOS Quartz implementation is intentionally deferred to the
-foreground-input stage; callers can observe ``available`` and fail explicitly.
+The default factory remains target-independent. DeviceManager replaces it with
+the guarded Quartz cursor service only after a macOS target/input backend exists.
 """
 
 from __future__ import annotations
@@ -59,7 +58,7 @@ def create_cursor_service(platform_name: str | None = None) -> CursorService:
     if platform_name == MACOS:
         return UnavailableCursorService(
             platform_name,
-            'the Quartz foreground cursor implementation is scheduled for Stage 5',
+            'a bound Quartz foreground interaction is required',
         )
     return UnavailableCursorService(
         platform_name,

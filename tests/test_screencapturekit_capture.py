@@ -280,7 +280,9 @@ class FakeBackend:
         )
 
 
-def make_capture(*, permission=None, target=None, backend=None, monotonic=None):
+def make_capture(
+        *, permission=None, target=None, backend=None, monotonic=None,
+        on_input_invalidated=None):
     return ScreenCaptureKitCaptureMethod(
         threading.Event(),
         target or FakeTarget(),
@@ -288,11 +290,45 @@ def make_capture(*, permission=None, target=None, backend=None, monotonic=None):
         backend=backend or FakeBackend(),
         lifecycle_timeout=0.1,
         monotonic=monotonic or (lambda: 10.0),
+        on_input_invalidated=on_input_invalidated,
     )
 
 
 def sample(value=1):
     return bytearray([value, value + 1, value + 2, 255] * 144)
+
+
+def test_capture_invalidation_notifies_input_gate_before_resource_shutdown():
+    backend = FakeBackend()
+    invalidations = []
+    capture = make_capture(
+        backend=backend,
+        on_input_invalidated=lambda _capture, reason: invalidations.append(reason),
+    )
+
+    capture.invalidate("target refresh started")
+    assert invalidations[-1] == "target refresh started"
+    assert backend.stops
+
+    capture.close()
+    assert invalidations[-1] == "ScreenCaptureKit capture closed"
+
+
+def test_sample_conversion_error_clears_geometry_and_invalidates_input():
+    backend = FakeBackend()
+    invalidations = []
+    capture = make_capture(
+        backend=backend,
+        on_input_invalidated=lambda _capture, reason: invalidations.append(reason),
+    )
+    backend.publish(sample(1))
+    assert capture.geometry is not None
+
+    backend.callbacks[-1][2]("bad complete sample")
+
+    assert capture.geometry is None
+    assert capture.get_frame_packet() is None
+    assert invalidations[-1] == "bad complete sample"
 
 
 def test_stream_is_started_once_and_publishes_latest_owned_bgr_frame():
@@ -687,12 +723,12 @@ def test_diagnostics_report_fps_age_conversion_errors_and_generations():
     backend.callbacks[0][2]('bad surface')
     diagnostics = capture.diagnostics()
 
-    assert diagnostics.fps == 1.0
-    assert diagnostics.frame_age_seconds == 1.0
+    assert diagnostics.fps == 0.0
+    assert diagnostics.frame_age_seconds is None
     assert diagnostics.frame_conversion_errors == 1
     assert diagnostics.target_generation == 1
     assert diagnostics.capture_generation > 0
-    assert diagnostics.geometry.target_generation == 1
+    assert diagnostics.geometry is None
     assert capture.get_frame() is None
 
 
