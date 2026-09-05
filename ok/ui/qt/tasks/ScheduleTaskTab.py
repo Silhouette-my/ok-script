@@ -40,6 +40,7 @@ from ok import Logger, og
 from ok.ui.qt.widget.Tab import Tab
 from ok.util.windows_schedule import (
     WindowsScheduleManager, ScheduleTaskInfo, TriggerType,
+    resolve_schedule_task_index,
     format_next_run_time as core_format_next_run_time,
     infer_trigger_type as core_infer_trigger_type,
     normalize_trigger_type as core_normalize_trigger_type,
@@ -264,10 +265,10 @@ class CreateScheduleTaskDialog(MessageBoxBase):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel(self.tr("Create Schedule Task"), self)
 
-        # 获取所有 onetime_tasks
+        # 获取所有 onetime_tasks（不筛 visible，未显示在 GUI 的任务也可计划调度）
         self.tasks = [
             task for task in (og.executor.onetime_tasks if og.executor.onetime_tasks else [])
-            if task.support_schedule_task and getattr(task, 'visible', True)
+            if task.support_schedule_task
         ]
         self.task_names = [og.app.tr(task.name) for task in self.tasks]
 
@@ -497,6 +498,9 @@ class ModifyScheduleTaskDialog(MessageBoxBase):
             self.viewLayout.setContentsMargins(16, 12, 16, 12)
 
             self.task_index, auto_exit_default = self._parse_args(task_info.actions)
+            if task_info.task_identifier:
+                self.task_index = resolve_schedule_task_index(
+                    task_info.task_identifier, og.executor.onetime_tasks)
             timeout_default = self._parse_timeout(task_info.xml_config)
             start_hour_default, start_minute_default = self._parse_start_time(task_info.next_run_time)
             interval_days_default, interval_hours_default = self._parse_custom_interval(task_info)
@@ -1098,6 +1102,19 @@ class ScheduleTaskTab(Tab):
             current = self.schedule_manager.cache.get(task_name)
             enabled = current.enabled if current else True
 
+            # 优先沿用缓存的稳定标识（模块路径.类名）；旧任务没有则按索引反查任务实例
+            task_identifier = None
+            if current and getattr(current, "task_identifier", None):
+                task_identifier = current.task_identifier
+            else:
+                try:
+                    tasks = og.executor.onetime_tasks if og.executor.onetime_tasks else []
+                    if isinstance(task_index, int) and 1 <= task_index <= len(tasks):
+                        task = tasks[task_index - 1]
+                        task_identifier = f"{task.__class__.__module__}.{task.__class__.__name__}"
+                except Exception:
+                    logger.exception("Failed to resolve task_identifier for modified task")
+
             deleted = self.schedule_manager.delete_task(task_name)
             if not deleted:
                 self.show_error(self.tr("Failed to modify task: cannot delete old task"))
@@ -1114,6 +1131,7 @@ class ScheduleTaskTab(Tab):
                 enabled=enabled,
                 interval_days=interval_days,
                 interval_hours=interval_hours,
+                task_identifier=task_identifier,
             )
             if success:
                 self.load_tasks()
@@ -1147,6 +1165,9 @@ class ScheduleTaskTab(Tab):
 
         def refresh():
             try:
+                from ok.ui.qt.tasks.schedule_index_sync import sync_schedule_task_indexes
+                sync_schedule_task_indexes(rewrite_argv=False)
+                self.schedule_manager.cache.load_cache()
                 tasks = self.schedule_manager.query_all_tasks(force_sync=True)
                 self.tasks_loaded.emit(tasks)
             except Exception as e:
@@ -1179,6 +1200,16 @@ class ScheduleTaskTab(Tab):
     ):
         """处理任务创建"""
         try:
+            # 根据索引反查任务实例，取模块路径.类名作为稳定标识（对排序免疫）
+            task_identifier = None
+            try:
+                tasks = og.executor.onetime_tasks if og.executor.onetime_tasks else []
+                if isinstance(task_index, int) and 1 <= task_index <= len(tasks):
+                    task = tasks[task_index - 1]
+                    task_identifier = f"{task.__class__.__module__}.{task.__class__.__name__}"
+            except Exception:
+                logger.exception("Failed to resolve task_identifier for new schedule task")
+
             success = self.schedule_manager.create_task(
                 task_name=name or f"AutoTask_{task_index}",
                 task_index=task_index,
@@ -1190,6 +1221,7 @@ class ScheduleTaskTab(Tab):
                 enabled=True,
                 interval_days=interval_days,
                 interval_hours=interval_hours,
+                task_identifier=task_identifier,
             )
             if success:
                 self.load_tasks()
