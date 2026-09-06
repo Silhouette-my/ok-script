@@ -74,3 +74,13 @@ def test_windows_create_still_uses_existing_backend(monkeypatch, scheduler_depen
     manager._create_task_via_schtasks.assert_called_once()
     cache.add_or_update.assert_called_once()
     run.assert_not_called()
+
+
+def test_unsupported_decorated_operation_never_enters_com(monkeypatch, scheduler_dependencies):
+    monkeypatch.setattr(schedule, 'sys', SimpleNamespace(platform='darwin'))
+    manager = schedule.WindowsScheduleManager({'gui_title': 'test'})
+    manager._com_session = Mock(side_effect=AssertionError('COM must not be initialized'))
+    assert not manager.create_task('test', 0, schedule.TriggerType.DAILY)
+    assert not manager._delete_task_by_path('synthetic')
+    assert not manager._set_task_enabled('synthetic', True)
+    manager._com_session.assert_not_called()
