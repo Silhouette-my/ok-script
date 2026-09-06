@@ -267,12 +267,12 @@ class TestDeviceManagerMacOSWindowSelection(unittest.TestCase):
 
         with (
                 patch('ok.device.DeviceManager.require_platform'),
-                patch(
-                    'ok.device.capture_methods.ScreenCaptureKitCaptureMethod',
-                    FakeCapture),
-                patch(
-                    'ok.device.interaction_methods.QuartzForegroundInteraction',
-                    FakeInteraction),
+                # Inject synthetic exports without resolving the real lazy
+                # macOS export first (which correctly rejects Windows hosts).
+                patch.dict('ok.device.capture_methods.__dict__',
+                           ScreenCaptureKitCaptureMethod=FakeCapture),
+                patch.dict('ok.device.interaction_methods.__dict__',
+                           QuartzForegroundInteraction=FakeInteraction),
         ):
             manager.do_start(notify=False)
 
