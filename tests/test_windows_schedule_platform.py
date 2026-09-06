@@ -84,3 +84,21 @@ def test_unsupported_decorated_operation_never_enters_com(monkeypatch, scheduler
     assert not manager._delete_task_by_path('synthetic')
     assert not manager._set_task_enabled('synthetic', True)
     manager._com_session.assert_not_called()
+
+
+def test_com_failure_fallback_preserves_upstream_stable_task_identity(monkeypatch, scheduler_dependencies):
+    import sys
+    client = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, 'win32com', SimpleNamespace(client=client))
+    monkeypatch.setitem(sys.modules, 'win32com.client', client)
+    manager = schedule.WindowsScheduleManager({'gui_title': 'test'})
+    manager.is_com_available = Mock(return_value=True)
+    manager._generate_task_xml = Mock(return_value='<Task/>')
+    manager.SCHEDULE_SERVICE = SimpleNamespace(Connect=Mock(side_effect=RuntimeError('synthetic failure')))
+    manager._create_task_via_schtasks = Mock(return_value=True)
+    assert manager._create_task_via_com(
+        'task', 1, schedule.TriggerType.DAILY, 2, 9, 0, True, True,
+        'description', 'synthetic-path', 0, 0, 'src.task.Task')
+    manager._create_task_via_schtasks.assert_called_once_with(
+        'task', 1, schedule.TriggerType.DAILY, True, 'synthetic-path',
+        2, 9, 0, True, 0, 0, 'description', 'src.task.Task')

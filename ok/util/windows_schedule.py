@@ -1035,7 +1035,7 @@ class WindowsScheduleManager:
             return self._create_task_via_schtasks(
                 task_name, task_index, trigger_type, enabled,
                 task_path, timeout_hours, start_hour, start_minute,
-                auto_exit, interval_days, interval_hours)
+                auto_exit, interval_days, interval_hours, description, task_identifier)
 
     def _create_task_via_schtasks(self, task_name: str, task_index: int,
                                   trigger_type: TriggerType, enabled: bool,
