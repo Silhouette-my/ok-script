@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import threading
 from typing import Callable, TypeVar
 
 from ok.device.services.permissions import PermissionKind
+from ok.device.capture_methods.screencapturekit_core import MAX_FRAME_AGE_SECONDS
 
 
 T = TypeVar("T")
@@ -125,7 +127,8 @@ class ForegroundGuard:
             snapshot = self.target.snapshot
         except Exception as error:
             raise ForegroundInputError(
-                "MAC_TARGET_EXITED", f"failed to verify target: {error}") from error
+                getattr(self.target, "unavailable_code", "MAC_TARGET_UNAVAILABLE"),
+                f"failed to verify target: {error}") from error
         if (
                 not target_exists
                 or not snapshot.exists
@@ -133,7 +136,8 @@ class ForegroundGuard:
                 or snapshot.candidate.process_id <= 0
                 or snapshot.candidate.window_id <= 0):
             raise ForegroundInputError(
-                "MAC_TARGET_EXITED", "selected macOS target is unavailable")
+                getattr(self.target, "unavailable_code", "MAC_TARGET_UNAVAILABLE"),
+                "selected macOS target is unavailable")
         for kind, code in (
                 (PermissionKind.SCREEN_RECORDING,
                  "MAC_SCREEN_CAPTURE_PERMISSION_REQUIRED"),
@@ -153,10 +157,6 @@ class ForegroundGuard:
         except Exception as error:
             raise ForegroundInputError(
                 "MAC_GAME_NOT_FOREGROUND", str(error)) from error
-        if not frontmost:
-            raise ForegroundInputError(
-                "MAC_GAME_NOT_FOREGROUND", "selected game is not frontmost")
-
         # ``is_foreground()`` performs another live target/geometry check. Read
         # the snapshot again so a same-size move discovered by that check cannot
         # pass with the older generation captured above.
@@ -167,7 +167,11 @@ class ForegroundGuard:
                 or snapshot.candidate.process_id <= 0
                 or snapshot.candidate.window_id <= 0):
             raise ForegroundInputError(
-                "MAC_TARGET_EXITED", "selected macOS target is unavailable")
+                getattr(self.target, "unavailable_code", "MAC_TARGET_UNAVAILABLE"),
+                "selected macOS target is unavailable")
+        if not frontmost:
+            raise ForegroundInputError(
+                "MAC_GAME_NOT_FOREGROUND", "selected game is not frontmost")
 
         diagnostics = self.capture.diagnostics()
         state = getattr(getattr(diagnostics, "state", None), "value", None)
@@ -186,6 +190,18 @@ class ForegroundGuard:
                 or geometry.capture_generation != self._capture_generation):
             raise ForegroundInputError(
                 "MAC_INPUT_GATE_CLOSED", "capture or target geometry generation changed")
+        age = getattr(diagnostics, "frame_age_seconds", None)
+        sequence = getattr(diagnostics, "frame_sequence", None)
+        captured = getattr(diagnostics, "captured_monotonic", None)
+        frame_geometry = getattr(diagnostics, "frame_geometry", None)
+        if (not isinstance(sequence, int) or sequence <= 0
+                or not isinstance(captured, (int, float)) or not math.isfinite(captured)
+                or not isinstance(age, (int, float)) or not math.isfinite(age)
+                or not 0 <= age <= MAX_FRAME_AGE_SECONDS
+                or frame_geometry != geometry):
+            raise ForegroundInputError(
+                "MAC_CAPTURE_FRAME_STALE",
+                "capture heartbeat unavailable or older than 2 seconds; explicitly resume after capture recovers")
         return geometry
 
     def open(self) -> tuple[int, int]:

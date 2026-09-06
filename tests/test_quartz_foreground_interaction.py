@@ -10,6 +10,7 @@ from ok.device.interaction_methods.quartz import (
     QuartzForegroundInteraction,
 )
 from ok.device.services import PermissionKind
+from ok.device.window_target.macos import PyObjCMacOSWindowSystem
 from ok.task.TaskExecutor import TaskExecutor
 from ok.util.handler import ExitEvent
 
@@ -29,6 +30,8 @@ class FakeCapture:
         self.geometry = FakeGeometry()
         self.state = "running"
         self.last_error = None
+        self.frame_age = 0.0
+        self.sequence = 1
 
     def diagnostics(self):
         return SimpleNamespace(
@@ -36,6 +39,10 @@ class FakeCapture:
             target_generation=self.geometry.target_generation,
             capture_generation=self.geometry.capture_generation,
             last_error=self.last_error,
+            frame_age_seconds=self.frame_age,
+            frame_sequence=self.sequence,
+            captured_monotonic=10.0,
+            frame_geometry=self.geometry,
         )
 
 
@@ -181,6 +188,110 @@ def test_focus_loss_rejects_ordinary_input_and_releases_held_key(interaction):
     assert not interaction.guard.is_open
 
 
+@pytest.mark.parametrize('move', [False, True])
+@pytest.mark.parametrize('button', ['left', 'right', 'middle'])
+def test_positioned_click_keeps_down_up_at_target_without_cursor_dependency(interaction, move, button):
+    # Deliberately never let a native cursor query stand in for event coordinates.
+    interaction._sleep = lambda _seconds: setattr(interaction.event_sink, 'position', (777, 888))
+    interaction.click(960, 540, move=move, key=button)
+    events = interaction.event_sink.events
+    assert [event for event in events if event[0] == 'button'] == [
+        ('button', button, True, (580.0, 320.0)),
+        ('button', button, False, (580.0, 320.0))]
+    assert [event for event in events if event[0] == 'move'] == (
+        [('move', (580.0, 320.0), None)] if move else [])
+    assert not [event for event in events if event[0] == 'cursor']
+    assert interaction.held_state.snapshot().buttons == ()
+
+
+@pytest.mark.parametrize('failure', ['focus', 'target-generation', 'capture-generation'])
+def test_no_move_click_still_rejects_invalid_foreground_or_generation(interaction, failure):
+    if failure == 'focus':
+        interaction.target.frontmost = False
+    elif failure == 'target-generation':
+        interaction.target.snapshot.generation += 1
+    else:
+        interaction.capture.geometry.capture_generation += 1
+    with pytest.raises(ForegroundInputError):
+        interaction.click(960, 540, move=False)
+    assert not [event for event in interaction.event_sink.events if event[0] in ('button', 'move')]
+
+
+@pytest.mark.parametrize('failure', ['sleep', 'stop', 'focus'])
+def test_no_move_click_interruption_releases_owned_button(interaction, failure):
+    def interrupt(_seconds):
+        if failure == 'sleep':
+            raise RuntimeError('interrupted sleep')
+        if failure == 'stop':
+            interaction.stop()
+        else:
+            interaction.target.frontmost = False
+            with pytest.raises(ForegroundInputError):
+                interaction.move(1, 1)  # Real guard invalidates and releases.
+    interaction._sleep = interrupt
+    with pytest.raises(RuntimeError):
+        interaction.click(960, 540, move=False)
+    buttons = [event for event in interaction.event_sink.events if event[0] == 'button']
+    assert buttons[0] == ('button', 'left', True, (580.0, 320.0))
+    assert sum(event[2] for event in buttons) == 1
+    assert any(not event[2] for event in buttons)
+    assert interaction.held_state.snapshot().buttons == ()
+    before = len(buttons)
+    interaction.release_all()
+    assert len([event for event in interaction.event_sink.events if event[0] == 'button']) == before
+
+
+@pytest.mark.parametrize('failure', [None, 'focus', 'generation'])
+def test_positioned_no_move_click_uses_production_sink_final_check(interaction, failure):
+    from test_quartz_modifier_release import QueuedQuartz
+    q = QueuedQuartz()
+    create = q.CGEventCreateMouseEvent
+
+    def create_then_invalidate(*args):
+        event = create(*args)
+        if failure == 'focus':
+            interaction.target.frontmost = False
+        elif failure == 'generation':
+            interaction.target.snapshot.generation += 1
+        return event
+
+    q.CGEventCreateMouseEvent = create_then_invalidate
+    interaction.event_sink = PyObjCQuartzEventSink(interaction.guard.check, quartz=q)
+    if failure:
+        with pytest.raises(ForegroundInputError):
+            interaction.click(960, 540, move=False)
+        assert q.posts == []
+    else:
+        interaction.click(960, 540, move=False)
+        assert [(post['kind'], post['point']) for post in q.posts] == [
+            (q.kCGEventLeftMouseDown, (580.0, 320.0)),
+            (q.kCGEventLeftMouseUp, (580.0, 320.0))]
+    assert interaction.held_state.snapshot().buttons == ()
+
+
+def test_no_move_click_preserves_no_coordinate_and_move_back_behavior(interaction):
+    interaction.click(move=False)
+    assert ('button', 'left', True, (20.0, 30.0)) in interaction.event_sink.events
+    interaction.click(960, 540, move=False, move_back=True)
+    assert interaction.event_sink.events[-1] == ('move', (20, 30), None)
+
+
+def test_no_move_click_does_not_release_an_existing_hold(interaction):
+    interaction.mouse_down(key='left')
+    assert interaction.click(960, 540, move=False) is False
+    assert interaction.held_state.snapshot().buttons == ('left',)
+    assert not any(event[:3] == ('button', 'left', False) for event in interaction.event_sink.events)
+
+
+def test_positioned_click_failed_up_invalidates_and_clears(interaction):
+    interaction.event_sink.fail_once = ('button', 'left', False, (580.0, 320.0))
+    with pytest.raises(ForegroundInputError, match='MAC_INPUT_POST_FAILED'):
+        interaction.click(960, 540, move=False)
+    assert interaction.held_state.snapshot().buttons == ()
+    assert not interaction.guard.is_open
+    assert any(event[:3] == ('button', 'left', False) for event in interaction.event_sink.events)
+
+
 def test_watchdog_releases_without_another_ordinary_event(interaction):
     interaction.mouse_down(key="right")
     interaction.target.frontmost = False
@@ -195,6 +306,44 @@ def test_watchdog_releases_without_another_ordinary_event(interaction):
         event[:3] == ("button", "right", False)
         for event in interaction.event_sink.events
     )
+
+
+@pytest.mark.parametrize("native_result", [(0, 789), (-600, 123)])
+def test_native_frontmost_change_releases_even_when_nsworkspace_is_stale(native_result):
+    system = object.__new__(PyObjCMacOSWindowSystem)
+    current = [(0, 123)]
+    system._workspace = SimpleNamespace(frontmostApplication=lambda: SimpleNamespace(
+        processIdentifier=lambda: 123))
+    system._application_services = SimpleNamespace(
+        GetFrontProcess=lambda _out: (0, (0, 1)),
+        GetProcessPID=lambda _serial, _out: current[0],
+    )
+    target = FakeTarget()
+    target.is_foreground = lambda: system.frontmost_process_id() == 123
+    value = QuartzForegroundInteraction(
+        FakeCapture(), target, FakePermissionService(),
+        event_sink=FakeSink(), monitor_interval=0.01)
+    try:
+        value.on_run()
+        value.send_key_down("w")
+        value.mouse_down(key="right")
+        current[0] = native_result
+        deadline = time.monotonic() + 0.5
+        while value.guard.is_open and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not value.guard.is_open
+        assert value.held_state.snapshot().keys == ()
+        assert value.held_state.snapshot().buttons == ()
+        assert ("key", macos_key_code("w"), False) in value.event_sink.events
+        assert any(event[:3] == ("button", "right", False) for event in value.event_sink.events)
+        before = [event for event in value.event_sink.events if event[0] != "cursor"]
+        with pytest.raises(ForegroundInputError):
+            value.send_key_down("a")
+        # Idempotent cleanup may query the cursor, but must not post any event.
+        assert [event for event in value.event_sink.events if event[0] != "cursor"] == before
+        assert target.activation_requested == 0
+    finally:
+        value.on_destroy()
 
 
 def test_watchdog_notifies_consumer_to_pause_once(interaction):
@@ -406,7 +555,7 @@ def test_post_failure_closes_gate_and_retries_matching_release(interaction):
     assert ("key", w, False) in interaction.event_sink.events
 
 
-def test_on_run_requests_activation_once_and_observes_frontmost():
+def test_on_run_does_not_steal_focus_and_requires_explicit_foreground():
     target = FakeTarget()
     target.frontmost = False
     value = QuartzForegroundInteraction(
@@ -417,8 +566,13 @@ def test_on_run_requests_activation_once_and_observes_frontmost():
         monitor_interval=0.01,
     )
     try:
+        with pytest.raises(ForegroundInputError, match='switch to the game'):
+            value.on_run()
+        assert not value.guard.is_open
+        assert target.activation_requested == 0
+        target.frontmost = True
         value.on_run()
-        assert target.activation_requested == 1
+        assert target.activation_requested == 0
         assert value.guard.is_open
     finally:
         value.on_destroy()
@@ -431,12 +585,12 @@ def test_activation_request_without_observed_frontmost_keeps_gate_closed():
     value = QuartzForegroundInteraction(
         FakeCapture(), target, FakePermissionService(), event_sink=FakeSink())
 
-    with pytest.raises(ForegroundInputError, match="did not become frontmost"):
+    with pytest.raises(ForegroundInputError, match="switch to the game"):
         value.on_run()
 
-    assert target.activation_requested == 1
+    assert target.activation_requested == 0
     assert not value.guard.is_open
-    assert value.event_sink.events == []
+    assert all(event == ('cursor',) for event in value.event_sink.events)
     value.on_destroy()
 
 

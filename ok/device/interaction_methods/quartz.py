@@ -21,6 +21,19 @@ from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
 _BUTTONS = frozenset({"left", "right", "middle"})
+# Public HIToolbox kVK_* and IOKit/hidsystem/IOLLEvent.h NX_DEVICE* masks.
+# Each entry is (aggregate mask, this side, the other side). Caps Lock is a
+# toggle, not an owned momentary modifier; its flag is left untouched.
+_MODIFIER_BITS = {
+    0x38: (0x20000, 0x2, 0x4),  # left Shift
+    0x3C: (0x20000, 0x4, 0x2),  # right Shift
+    0x3B: (0x40000, 0x1, 0x2000),  # left Control
+    0x3E: (0x40000, 0x2000, 0x1),  # right Control
+    0x3A: (0x80000, 0x20, 0x40),  # left Option
+    0x3D: (0x80000, 0x40, 0x20),  # right Option
+    0x37: (0x100000, 0x8, 0x10),  # left Command
+    0x36: (0x100000, 0x10, 0x8),  # right Command
+}
 
 
 class QuartzEventSink(Protocol):
@@ -41,6 +54,38 @@ class PyObjCQuartzEventSink:
             import Quartz  # type: ignore[import-untyped]
             quartz = Quartz
         self.quartz = quartz
+        # False means release was requested but may still be queued in Quartz.
+        # Interaction serializes all sink calls with its existing input lock.
+        self._modifier_state: dict[int, bool] = {}
+
+    def _retire_released_modifiers(self) -> None:
+        q = self.quartz
+        for code, down in tuple(self._modifier_state.items()):
+            if not down and not any(q.CGEventSourceKeyState(source, code) for source in (
+                    q.kCGEventSourceStateHIDSystemState,
+                    q.kCGEventSourceStateCombinedSessionState)):
+                del self._modifier_state[code]
+
+    def _post_with_modifiers(self, event, *, ordinary: bool, transition=None) -> None:
+        state = dict(self._modifier_state)
+        if transition is not None:
+            state[transition[0]] = transition[1]
+        if event is not None and state:
+            flags = int(self.quartz.CGEventGetFlags(event))
+            groups = set()
+            for code, down in state.items():
+                aggregate, side, other = _MODIFIER_BITS[code]
+                flags = (flags | side) if down else (flags & ~side)
+                groups.add((aggregate, side | other))
+            for aggregate, sides in groups:
+                flags = (flags | aggregate) if flags & sides else (flags & ~aggregate)
+            # Preserve flags belonging to other physical modifiers and the
+            # opposite side; only our owned/pending modifier sides are changed.
+            self.quartz.CGEventSetFlags(event, flags)
+        self._post(event, ordinary=ordinary)
+        if transition is not None:
+            # In particular, a rejected down must never become owned state.
+            self._modifier_state[transition[0]] = transition[1]
 
     def _post(self, event, *, ordinary: bool) -> None:
         if event is None:
@@ -53,9 +98,18 @@ class PyObjCQuartzEventSink:
         self.quartz.CGEventPost(self.quartz.kCGHIDEventTap, event)
 
     def key_event(self, key_code: int, is_down: bool) -> None:
-        self._post(
+        if is_down:
+            # Retire acknowledged releases before creating the next event;
+            # its native flags can then reflect new physical modifier input.
+            self._retire_released_modifiers()
+        elif key_code in _MODIFIER_BITS:
+            # Even a failed up must not be reasserted by later best-effort
+            # releases. This is intended state, not proof that Quartz drained.
+            self._modifier_state[key_code] = False
+        self._post_with_modifiers(
             self.quartz.CGEventCreateKeyboardEvent(None, key_code, is_down),
             ordinary=is_down,
+            transition=(key_code, is_down) if key_code in _MODIFIER_BITS else None,
         )
 
     def cursor_position(self) -> tuple[float, float]:
@@ -92,26 +146,30 @@ class PyObjCQuartzEventSink:
         }[button]
 
     def mouse_move(self, position: tuple[float, float], button: str | None = None) -> None:
+        self._retire_released_modifiers()
         button_code = (
             self.quartz.kCGMouseButtonLeft
             if button is None else self._mouse_button_code(button))
         event = self.quartz.CGEventCreateMouseEvent(
             None, self._mouse_event_type(button), position, button_code)
-        self._post(event, ordinary=True)
+        self._post_with_modifiers(event, ordinary=True)
 
     def mouse_button(self, button: str, is_down: bool, position: tuple[float, float]) -> None:
+        if is_down:
+            self._retire_released_modifiers()
         event = self.quartz.CGEventCreateMouseEvent(
             None,
             self._mouse_event_type(button, is_down),
             position,
             self._mouse_button_code(button),
         )
-        self._post(event, ordinary=is_down)
+        self._post_with_modifiers(event, ordinary=is_down)
 
     def scroll(self, amount: int) -> None:
+        self._retire_released_modifiers()
         event = self.quartz.CGEventCreateScrollWheelEvent(
             None, self.quartz.kCGScrollEventUnitLine, 1, int(amount))
-        self._post(event, ordinary=True)
+        self._post_with_modifiers(event, ordinary=True)
 
 
 class QuartzForegroundCursorService:
@@ -171,6 +229,7 @@ class QuartzForegroundInteraction(BaseInteraction):
         self._on_invalidated = on_invalidated
         self._sleep = sleep
         self._input_lock = threading.RLock()
+        self._start_lock = threading.Lock()
         self.guard = ForegroundGuard(
             target,
             capture,
@@ -287,16 +346,29 @@ class QuartzForegroundInteraction(BaseInteraction):
         del name
         button = self._button(key)
         previous = self.get_cursor_position() if move_back else None
-        if move:
-            pressed = self.mouse_down(x, y, key=button)
-        else:
-            pressed = self.mouse_down(key=button)
-        if not pressed:
+
+        def press(geometry):
+            if self.held_state.has_button(button):
+                return None
+            positioned = x != -1 and y != -1
+            position = (self._global_point(geometry, x, y) if positioned
+                        else self.event_sink.cursor_position())
+            # move controls only the extra move event, not the button location.
+            # Keep this click's point local: independent holds/swipes still use
+            # their existing release-at-cursor semantics.
+            if move and positioned:
+                self.event_sink.mouse_move(position)
+            self.event_sink.mouse_button(button, True, position)
+            self.held_state.hold_button(button)
+            return position
+
+        position = self._ordinary(press)
+        if position is None:
             return False
         try:
             self._sleep(max(0.0, float(down_time)))
         finally:
-            released = self.mouse_up(key=button)
+            released = self._mouse_up(button, position=position)
         if not released and not self.guard.is_open:
             raise ForegroundInputError("MAC_INPUT_GATE_CLOSED", self.guard.reason)
         if previous is not None:
@@ -321,12 +393,15 @@ class QuartzForegroundInteraction(BaseInteraction):
         return self._ordinary(press)
 
     def mouse_up(self, key="left"):
-        button = self._button(key)
+        return self._mouse_up(self._button(key))
+
+    def _mouse_up(self, button, *, position=None):
         with self._input_lock:
             if not self.held_state.has_button(button):
                 return False
             try:
-                position = self.event_sink.cursor_position()
+                if position is None:
+                    position = self.event_sink.cursor_position()
                 self.event_sink.mouse_button(button, False, position)
             except Exception as error:
                 failure = ForegroundInputError("MAC_INPUT_POST_FAILED", str(error))
@@ -418,16 +493,31 @@ class QuartzForegroundInteraction(BaseInteraction):
         self._monitor_thread.start()
 
     def on_run(self):
-        if not self.target.is_foreground():
-            if not self.target.request_activation():
+        # Awaiting a new frame must not hold the input lock: shutdown and
+        # capture invalidation need it to release held state immediately.
+        with self._start_lock:
+            if self.guard.is_open:
+                return
+            try:
+                readiness = getattr(self.capture, "await_fresh_frame", None)
+                if callable(readiness):
+                    readiness()
+                self._arm_ready_provider()
+            except Exception as error:
+                self._invalidate_and_release(str(error))
+                raise
+
+    def _arm_ready_provider(self):
+        with self.guard.lock:
+            if self.guard.is_open:
+                # Additional enabled tasks must not reset an active input owner.
+                return
+            if not self.target.is_foreground():
                 raise ForegroundInputError(
-                    "MAC_GAME_NOT_FOREGROUND", "game activation request was rejected")
-            if not self.target.wait_for_observed_activation(self.activation_timeout):
-                raise ForegroundInputError(
-                    "MAC_GAME_NOT_FOREGROUND", "game did not become frontmost")
-        target_generation, _capture_generation = self.guard.open()
-        self.held_state.begin(threading.get_ident(), target_generation)
-        self._ensure_monitor()
+                    "MAC_GAME_NOT_FOREGROUND", "switch to the game before starting or resuming")
+            target_generation, _capture_generation = self.guard.open()
+            self.held_state.begin(threading.get_ident(), target_generation)
+            self._ensure_monitor()
 
     def should_capture(self):
         return self.guard.is_open
