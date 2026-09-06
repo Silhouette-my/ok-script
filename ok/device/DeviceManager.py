@@ -125,6 +125,9 @@ class DeviceManager:
         supported_resolution = app_config.get(
             'supported_resolution', {})
         self.supported_ratio = parse_ratio(supported_resolution.get('ratio'))
+        self.coordinate_mode = supported_resolution.get('coordinate_mode', 'legacy')
+        if self.coordinate_mode not in ('legacy', 'anchored'):
+            raise ValueError('unknown supported_resolution coordinate_mode')
         configured_windows = app_config.get('windows')
         configured_macos = app_config.get('macos')
         configured_browser = app_config.get('browser')
@@ -317,6 +320,46 @@ class DeviceManager:
             return self.window_target.refresh()
         finally:
             self.update_macos_device()
+
+    def prepare_macos_capture(self, timeout=8.0, *, manual_window_id=None):
+        """Prepare capture only; all GUI/start/resume callers share this contract.
+
+        Selection, provider creation and bounded fresh-frame recovery are owned
+        here. Input remains stopped until Quartz performs its final handoff.
+        """
+        with self._device_lifecycle_lock:
+            if self._closing or self.exit_event.is_set():
+                raise RuntimeError('macOS device is stopping')
+            if manual_window_id is not None:
+                selection = self.bind_macos_window(manual_window_id=manual_window_id)
+                if selection.selected is None:
+                    raise RuntimeError(f'MAC_GAME_WINDOW_NOT_FOUND: {selection.status.value}')
+            self.prepare_macos_device()
+            return self.capture_method.wait_until_ready(timeout=timeout)
+
+    def prepare_macos_device(self):
+        """Explicit startup only: bind a unique target before creating providers."""
+        self._require_macos_window_config()
+        with self._device_lifecycle_lock:
+            if self._closing or self.exit_event.is_set():
+                raise RuntimeError('macOS device is stopping')
+            if self.window_target is None:
+                selection = self.bind_macos_window()
+                if selection.selected is None:
+                    raise RuntimeError(
+                        'MAC_GAME_WINDOW_NOT_FOUND: select the official game window; '
+                        f'window selection: {selection.status.value}')
+            elif not self.window_target.exists():
+                # Start is recovery of this binding, not permission to replace
+                # a dead process or guess between multiple game surfaces.
+                result = self.refresh_macos_window_target()
+                if not result.current.exists:
+                    code = getattr(self.window_target, 'unavailable_code', 'MAC_TARGET_UNAVAILABLE')
+                    raise RuntimeError(
+                        f'{code}: window recovery {result.status.value}; '
+                        'wait and retry, or manually select and bind the game window')
+            self.config['preferred'] = 'macos'
+            self._do_start_locked(notify=False)
 
     def macos_permission_status(self):
         self._ensure_macos_window_services()
