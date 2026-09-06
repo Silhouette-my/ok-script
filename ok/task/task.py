@@ -321,6 +321,12 @@ class ExecutorOperation:
         if name is None:
             name = f"{x} {y} {width} {height}"
         if self.out_of_ratio():
+            if getattr(self.executor.device_manager, 'coordinate_mode', 'legacy') == 'anchored':
+                from ok.feature.layout import anchored_box
+                coords = anchored_box(x, y, to_x, to_y, width, height, self.width, self.height,
+                                      self.executor.device_manager.supported_ratio,
+                                      hcenter=hcenter, vcenter=vcenter)
+                return Box(*coords, name=name, confidence=confidence)
             should_width = self.executor.device_manager.supported_ratio * self.height
             return self.box_of_screen_scaled(should_width, self.height,
                                              x_original=x * should_width,
@@ -338,6 +344,18 @@ class ExecutorOperation:
             return False
         return self.executor.device_manager.supported_ratio and abs(
             self.width / self.height - self.executor.device_manager.supported_ratio) > 0.01
+
+    def _anchored_roi(self, image, x, y, to_x, to_y, width, height, name=None):
+        manager = self.executor.device_manager
+        if getattr(manager, 'coordinate_mode', 'legacy') != 'anchored':
+            return None
+        frame_height, frame_width = image.shape[:2]
+        ratio = manager.supported_ratio
+        if not ratio or not frame_height or abs(frame_width / frame_height - ratio) <= 0.01:
+            return None
+        from ok.feature.layout import anchored_box
+        return Box(*anchored_box(x, y, to_x, to_y, width, height,
+                                 frame_width, frame_height, ratio), name=name)
 
     def ensure_in_front(self):
         if self.is_adb():
@@ -379,10 +397,16 @@ class ExecutorOperation:
                        down_time=0.02,
                        key="left"):
         if self.out_of_ratio():
-            should_width = self.executor.device_manager.supported_ratio * self.height
-            x, y, w, h, scale = adjust_coordinates(x * should_width, y * self.height, 0, 0,
-                                                   self.screen_width, self.screen_height, should_width,
-                                                   self.height, hcenter=hcenter, vcenter=vcenter)
+            if getattr(self.executor.device_manager, 'coordinate_mode', 'legacy') == 'anchored':
+                from ok.feature.layout import anchored_point
+                x, y = anchored_point(x, y, self.width, self.height,
+                                      self.executor.device_manager.supported_ratio,
+                                      hcenter=hcenter, vcenter=vcenter)
+            else:
+                should_width = self.executor.device_manager.supported_ratio * self.height
+                x, y, w, h, scale = adjust_coordinates(x * should_width, y * self.height, 0, 0,
+                                                       self.screen_width, self.screen_height, should_width,
+                                                       self.height, hcenter=hcenter, vcenter=vcenter)
         else:
             x, y = int(self.width * x), int(self.height * y)
         self.click(x, y, move_back, name=name, move=move, down_time=down_time, after_sleep=after_sleep,
@@ -597,6 +621,10 @@ class FindFeature(ExecutorOperation):
             return []
         if box and isinstance(box, str):
             box = self.get_box_by_name(box)
+        if box is None and x != -1 and y != -1:
+            box = self._anchored_roi(image, x, y, to_x, to_y,
+                                     0 if width == -1 else width,
+                                     0 if height == -1 else height)
         return self.executor.feature_set.find_feature(image, feature_name,
                                                       horizontal_variance,
                                                       vertical_variance,
@@ -790,7 +818,9 @@ class OCR(FindFeature):
         match = self.fix_match_regex(match)
         frame_height, frame_width = image.shape[0], image.shape[1]
         if box is None:
-            box = relative_box(frame_width, frame_height, x, y, to_x, to_y, width, height, name)
+            box = self._anchored_roi(image, x, y, to_x, to_y, width, height, name)
+            if box is None:
+                box = relative_box(frame_width, frame_height, x, y, to_x, to_y, width, height, name)
         if box is not None:
             image = image[box.y:box.y + box.height, box.x:box.x + box.width]
             if not box.name and match:
@@ -1253,8 +1283,16 @@ class BaseTask(OCR):
             self.sleep(1)
 
     def unpause(self):
-        self._paused = False
-        self.executor.start()
+        if not self.get_device_capabilities().foreground_only:
+            self._paused = False
+            self.executor.start()
+        elif not self.enabled:
+            # Stop buttons also call unpause: never reactivate/rearm a disabled task.
+            self._paused = False
+            self.executor._wake_executor()
+        else:
+            self.executor.start()
+            self._paused = False
         communicate.task.emit(self)
 
     @property
@@ -1378,9 +1416,16 @@ class BaseTask(OCR):
         self.info[key] = self.info.get(key, 0) + count
 
     def load_config(self):
+        import sys
+        if sys.platform == 'darwin' and not isinstance(self, TriggerTask):
+            self.default_config.setdefault('Preparation Seconds', 8)
+            self.config_description.setdefault('Preparation Seconds',
+                'Seconds after switching to the game (0-300). Switching away cancels startup.')
         self.config = Config(self.__class__.__name__, self.default_config, validator=self.validate)
 
     def validate(self, key, value):
+        if key == 'Preparation Seconds' and (type(value) is not int or not 0 <= value <= 300):
+            return False, '准备时间须为 0–300 的整数秒 / Use an integer from 0 to 300 seconds'
         message = self.validate_config(key, value)
         if message:
             return False, message
