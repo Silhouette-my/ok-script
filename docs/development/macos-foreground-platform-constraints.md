@@ -33,12 +33,14 @@
 
 ## 2. 支持基线与禁止范围
 
-首个 consumer 基线：
+框架公开 API 设计与通用 host gate 基线（不是 consumer 二进制发行承诺）：
 
 - Apple Silicon arm64；
 - macOS 13+；
 - Python 3.12 arm64；
 - AppKit、ScreenCaptureKit、Core Graphics / Quartz、ApplicationServices、Foundation / CoreFoundation 等公开 API。
+
+当前首个 consumer OK-WW 的 packaged MVP 发行基线为 Apple Silicon、macOS 15+、Python 3.12 arm64，原因是随包 Python/PySide6 wrapper 的真实 Mach-O 最低版本。用户于 2026-09-06 授权 contributor 分支收窄，见 [ADR 0002](decisions/0002-consumer-packaged-minimum-version.md)；不代表 upstream 接受。框架 host gate 仍为 13+，公开 API 设计继续兼顾 13+；完整依赖组合在 13/14 的兼容性与硬件支持仍须独立证明。不得通过下调 plist、Mach-O 标记或仅设编译环境变量声称支持旧系统。
 
 本 MVP 不实现：
 

@@ -37,6 +37,10 @@ Start with `0001`. Keep `0000-template.md` unchanged as the template.
 
 A proposed ADR does not authorize runtime implementation that violates current constraints. The decision must be accepted by the relevant project owners/maintainers first.
 
+本 contributor 集成分支的用户可以明确授权其分支内的设计决定；ADR 必须注明授权范围，不代表 upstream 接受。最终上游审查和验收门槛不变。
+
+当前配套决策：[ADR 0002：consumer 打包最低版本与框架设计基线分离](0002-consumer-packaged-minimum-version.md)。OK-WW packaged MVP 收窄为 macOS 15+，框架公开 API 设计与 host gate 保留 13+。
+
 ## Required review
 
 An ADR must identify:

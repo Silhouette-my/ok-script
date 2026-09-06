@@ -16,6 +16,8 @@ Before changing macOS-related platform code, read:
 
 The framework implementation must not expand the product into background control, private APIs, process injection, or permission bypasses.
 
+框架公开 API 设计与通用 host gate 保留 Apple Silicon、macOS 13+；当前 OK-WW packaged MVP 因 Python/PySide6 原生依赖收窄为 macOS 15+，见 `docs/development/decisions/0002-consumer-packaged-minimum-version.md`。consumer 发行基线不应反向提高通用 host gate，也不得据此声称框架依赖组合已在 macOS 13/14 完整验收。此为用户授权的 contributor 分支决定，upstream 接受仍待最终审查。
+
 ## Instruction Precedence and Change Control
 
 - The companion OK-WW `MACOS_ENGINEERING_CONSTRAINTS.md` is the normative product contract.
