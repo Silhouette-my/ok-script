@@ -276,6 +276,7 @@ class MainWindow(FluentWindow):
         communicate.notification.connect(self.show_notification)
         communicate.config_validation.connect(self.config_validation)
         communicate.starting_emulator.connect(self.starting_emulator)
+        communicate.macos_start_status.connect(self.macos_start_status)
         communicate.global_config.connect(self.goto_global_config)
 
         logger.info('main window __init__ done')
@@ -686,6 +687,21 @@ class MainWindow(FluentWindow):
             else:
                 self.emulator_starting_dialog.restart_countdown(seconds_left)
             self.emulator_starting_dialog.show()
+
+    def macos_start_status(self, token, phase, seconds_left):
+        from ok import og
+        if token is not og.app.start_controller._start_cancel:
+            return
+        if phase == 'done':
+            if self.emulator_starting_dialog:
+                self.emulator_starting_dialog.close()
+            return
+        if self.emulator_starting_dialog is None:
+            self.emulator_starting_dialog = StartLoadingDialog(seconds_left, self)
+        dialog = self.emulator_starting_dialog
+        dialog.set_macos_status(phase, seconds_left)
+        if phase == 'foreground' and not dialog.isVisible():
+            dialog.show()
 
     def config_validation(self, message):
         title = self.tr('Error')

@@ -1,3 +1,5 @@
+import sys
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget, QSizePolicy
 from qfluentwidgets import FluentIcon, PrimaryPushButton, PushButton, SwitchButton, MessageBox
@@ -8,6 +10,12 @@ from ok.ui.qt.common.OKIcon import OKIcon
 from ok.ui.qt.tasks.ConfigCard import ConfigCard
 
 logger = Logger.get_logger(__name__)
+
+
+def macos_device_selected():
+    manager = getattr(og, 'device_manager', None)
+    device = manager.get_preferred_device() if manager is not None else None
+    return isinstance(device, dict) and device.get('device') == 'macos'
 
 
 class TaskCard(ConfigCard):
@@ -142,7 +150,14 @@ class TaskCard(ConfigCard):
             text = f'[{detail}]' if detail else ''
         self.compatibility_label.setText(text)
         self.compatibility_label.setToolTip(state.get('reason') or text)
-        self.compatibility_label.setVisible(bool(text))
+        # Keep enforcement and diagnostic detail, without crowding Mac task rows.
+        self.compatibility_label.setVisible(bool(text) and sys.platform != 'darwin')
+        if sys.platform == 'darwin':
+            self.card.titleLabel.setToolTip(state.get('reason') or text)
+        if macos_device_selected() and getattr(self, 'onetime', False):
+            # This button requests connection/start, not permission to post input.
+            # The controller rechecks requirements after provider creation.
+            return status != 'unsupported'
         return status not in {'missing-capabilities', 'unsupported'}
 
     def update_content(self):
@@ -161,7 +176,10 @@ class TaskCard(ConfigCard):
         self.setExpand(False)
         if self.task.enabled and self.task.paused:
             logger.info(f"resume paused task {self.task}")
-            self.task.unpause()
+            if macos_device_selected() or self.task.get_device_capabilities().foreground_only:
+                og.app.start_controller.start(self.task)
+            else:
+                self.task.unpause()
             return
         if self.task.first_run_alert:
             if not self.task.config.get('_first_run_alert'):

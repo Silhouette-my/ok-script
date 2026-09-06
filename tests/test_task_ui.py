@@ -121,7 +121,8 @@ class TestTaskUi(unittest.TestCase):
         self.addCleanup(card.close)
 
         self.assertEqual('[MAC_BASIC · experimental]', card.compatibility_label.text())
-        self.assertFalse(card.compatibility_label.isHidden())
+        import sys
+        self.assertEqual(sys.platform == 'darwin', card.compatibility_label.isHidden())
         self.assertTrue(card.enable_button.isEnabled())
         self.assertEqual('Awaiting real-game validation', card.compatibility_label.toolTip())
 
