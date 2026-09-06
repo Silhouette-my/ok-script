@@ -216,6 +216,7 @@ def test_controller_resume_and_queued_start_reach_readiness(monkeypatch, queued,
     controller._handoff_lock = threading.Lock()
     controller._handoff_pending = True
     manager = SimpleNamespace(
+        capture_method=interaction.capture,
         get_preferred_device=lambda: {'device': 'macos'},
         window_target=SimpleNamespace(process_id=10, discovery=SimpleNamespace(
             system=SimpleNamespace(frontmost_process_id=lambda: 10))))

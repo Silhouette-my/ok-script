@@ -17,7 +17,8 @@ def setup_controller(monkeypatch):
     controller.starting = False
     target = SimpleNamespace(process_id=10, discovery=SimpleNamespace(system=SimpleNamespace(
         frontmost_process_id=lambda: 10)))
-    manager = SimpleNamespace(window_target=target, get_preferred_device=lambda: {'device': 'macos'})
+    manager = SimpleNamespace(window_target=target, capture_method=object(),
+                              get_preferred_device=lambda: {'device': 'macos'})
     executor = SimpleNamespace(get_all_tasks=lambda: [])
     monkeypatch.setattr(module, 'og', SimpleNamespace(device_manager=manager, executor=executor))
     monkeypatch.setattr(module, 'communicate', SimpleNamespace(
@@ -185,6 +186,7 @@ def test_connect_before_foreground_and_never_bypass_requirements(monkeypatch, fa
         return run
     manager = module.og.device_manager
     manager.prepare_macos_capture = Mock(side_effect=step('connect'))
+    manager.capture_method = object()
     module.communicate.adb_devices = Mock()
     task = SimpleNamespace(ensure_device_capabilities=Mock(side_effect=step('capabilities')))
     controller._connect_macos_for_task = lambda task: StartController._connect_macos_for_task(controller, task)
@@ -204,3 +206,14 @@ def test_cancel_before_connection_does_not_create_provider(monkeypatch):
     with pytest.raises(RuntimeError, match='cancelled'):
         StartController._connect_macos_for_task(controller, None)
     module.og.device_manager.prepare_macos_capture.assert_not_called()
+
+
+@pytest.mark.parametrize('same_provider', [True, False])
+def test_start_device_reuses_preparation_only_within_same_attempt(monkeypatch, same_provider):
+    controller, _, _ = setup_controller(monkeypatch)
+    manager = module.og.device_manager
+    manager.capture_method = object()
+    manager.prepare_macos_capture = Mock()
+    controller._prepared_macos_capture = manager.capture_method if same_provider else object()
+    assert StartController.start_device(controller)
+    assert manager.prepare_macos_capture.call_count == (0 if same_provider else 1)

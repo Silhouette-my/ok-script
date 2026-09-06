@@ -88,6 +88,7 @@ class StartController:
 
     def do_start(self, task=None, exit_after=False):
         self.starting = True
+        self._prepared_macos_capture = None
         previous = []
         macos = False
         try:
@@ -97,6 +98,7 @@ class StartController:
                 if not hasattr(self, '_start_cancel'):
                     self._start_cancel = threading.Event()
                 self._connect_macos_for_task(task)
+                self._prepared_macos_capture = og.device_manager.capture_method
                 self._wait_for_macos_foreground()
                 self._wait_for_macos_preparation(task)
                 with self._handoff_lock:
@@ -119,6 +121,7 @@ class StartController:
             communicate.starting_emulator.emit(True, str(error), 0)
             return False
         finally:
+            self._prepared_macos_capture = None
             if macos:
                 self._publish_macos_status('done', 0)
             self.starting = False
@@ -316,7 +319,11 @@ class StartController:
         logger.info(f'start_device: {device}')
 
         if device and device['device'] == 'macos':
-            og.device_manager.prepare_macos_capture(timeout=8.0)
+            # do_start already prepared this provider before user handoff.
+            # Direct callers (or provider replacement) still use the same owner.
+            prepared = getattr(self, '_prepared_macos_capture', None)
+            if prepared is None or prepared is not og.device_manager.capture_method:
+                og.device_manager.prepare_macos_capture(timeout=8.0)
             return True
 
         if device and not device['connected']:
