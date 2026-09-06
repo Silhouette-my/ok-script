@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+import errno
+import logging
+import os
 import threading
 import time
 from typing import Callable, Protocol
@@ -30,6 +33,8 @@ from ok.device.window_target.selection import (
 )
 from ok.platform import require_macos_foreground_host
 
+logger = logging.getLogger(__name__)
+
 
 class WindowDiscoveryError(RuntimeError):
     """Raised when the operating system cannot provide shareable windows."""
@@ -45,6 +50,8 @@ class MacOSWindowSystem(Protocol):
     def frontmost_process_id(self) -> int | None: ...
 
     def process_exists(self, process_id: int) -> bool: ...
+
+    def process_exit_evidence(self, process_id: int) -> tuple[bool | None, bool | None]: ...
 
     def window_exists(self, process_id: int, window_id: int) -> bool: ...
 
@@ -100,13 +107,14 @@ class PyObjCMacOSWindowSystem:
     def __init__(self):
         require_macos_foreground_host("PyObjC macOS window system")
         import AppKit
+        import ApplicationServices
         import Quartz
         import ScreenCaptureKit
 
         self._appkit = AppKit
+        self._application_services = ApplicationServices
         self._quartz = Quartz
         self._screen_capture_kit = ScreenCaptureKit
-        self._workspace = AppKit.NSWorkspace.sharedWorkspace()
 
     def enumerate_windows(self, timeout: float) -> tuple[WindowCandidate, ...]:
         if timeout <= 0:
@@ -180,14 +188,44 @@ class PyObjCMacOSWindowSystem:
             process_id)
 
     def frontmost_process_id(self) -> int | None:
-        application = self._workspace.frontmostApplication()
-        if application is None:
+        # Source/worker hardware tests observed frontmostApplication retaining
+        # the previous app while this synchronous query already saw the switch.
+        # Safety checks must not use that stale NSWorkspace view. These public,
+        # deprecated HIServices APIs query
+        # the current front process synchronously; never fall back on failure.
+        try:
+            status, serial = self._application_services.GetFrontProcess(None)
+            if status != 0 or serial is None:
+                return None
+            status, process_id = self._application_services.GetProcessPID(serial, None)
+        except Exception as error:
+            raise WindowDiscoveryError("failed to query the macOS front process") from error
+        if status != 0 or process_id is None or int(process_id) <= 0:
             return None
-        return int(application.processIdentifier())
+        return int(process_id)
 
     def process_exists(self, process_id: int) -> bool:
         application = self._running_application(process_id)
         return bool(application is not None and not application.isTerminated())
+
+    def process_exit_evidence(self, process_id: int) -> tuple[bool | None, bool | None]:
+        """Independent observations; unknown must never confirm process death."""
+        try:
+            os.kill(process_id, 0)
+            posix_alive = True
+        except OSError as error:
+            posix_alive = (False if error.errno == errno.ESRCH else
+                           True if error.errno == errno.EPERM else None)
+        try:
+            windows = self._quartz.CGWindowListCopyWindowInfo(
+                self._quartz.kCGWindowListOptionAll,
+                self._quartz.kCGNullWindowID)
+            window_alive = (None if windows is None else any(
+                int(info.get(self._quartz.kCGWindowOwnerPID, 0) or 0) == process_id
+                for info in windows))
+        except Exception:
+            window_alive = None
+        return posix_alive, window_alive
 
     def _window_info(self, process_id: int, window_id: int):
         if process_id <= 0 or window_id <= 0:
@@ -308,6 +346,12 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
         self._sleep = sleep
         self._state_lock = threading.RLock()
         self._refresh_lock = threading.Lock()
+        # Recovery metadata only: never expose this as usable capture geometry.
+        self._last_bound_candidate = candidate
+        self._process_exited = False
+        self._unavailable_code = "MAC_TARGET_UNAVAILABLE"
+        self._exit_samples = 0
+        self._last_exit_sample = None
         super().__init__(candidate)
 
     @property
@@ -322,10 +366,99 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                 candidate.process_id, candidate.window_id)
         )
 
+    @property
+    def unavailable_code(self) -> str:
+        with self._state_lock:
+            return self._unavailable_code
+
+    def _mark_unavailable(self, *, process_exited=False):
+        self._process_exited = self._process_exited or process_exited
+        self._unavailable_code = (
+            "MAC_TARGET_EXITED" if self._process_exited else "MAC_TARGET_UNAVAILABLE")
+        self._update_candidate(None, exists=False)
+
+    def _observe_process(self, process_id, *, bound_candidate=None):
+        # Never sleep or enumerate SCK on the input path. A negative AppKit
+        # sample may be contradicted only for the currently valid exact binding.
+        # Lost bindings still require explicit refresh and a new capture epoch.
+        try:
+            alive = self.discovery.system.process_exists(process_id)
+        except Exception:
+            alive = None
+        with self._state_lock:
+            if alive is True:
+                self._exit_samples = 0
+                self._last_exit_sample = None
+                return True
+            current = super().snapshot
+            if (alive is False and current.exists and bound_candidate is not None
+                    and current.candidate == bound_candidate):
+                posix_alive = window_alive = geometry = frontmost = None
+                try:
+                    posix_alive, window_alive = self.discovery.system.process_exit_evidence(process_id)
+                    geometry = self.discovery.system.window_geometry(
+                        process_id, bound_candidate.window_id)
+                    frontmost = self.discovery.system.frontmost_process_id()
+                except Exception:
+                    # Partial/unknown observations cannot keep a binding usable.
+                    geometry = None
+                corroborated = (posix_alive is True and window_alive is True
+                                and geometry == bound_candidate.outer_geometry
+                                and frontmost == process_id)
+                logger.warning(
+                    'macOS liveness appkit=%s posix=%s cgwindow_pid=%s bound_window=%s '
+                    'geometry_unchanged=%s frontmost_matches=%s target_generation=%s decision=%s',
+                    alive, posix_alive, window_alive, geometry is not None,
+                    geometry == bound_candidate.outer_geometry, frontmost == process_id,
+                    current.generation, 'corroborated-bound-window' if corroborated else 'unavailable')
+                if corroborated:
+                    self._exit_samples = 0
+                    self._last_exit_sample = None
+                    return True
+            was_available = super().snapshot.exists
+            self._mark_unavailable()
+            now = self._monotonic()
+            if was_available:
+                # Let the guard release held input before doing extra queries.
+                self._exit_samples = 0
+                self._last_exit_sample = now
+                logger.warning("macOS liveness pid=%s appkit=%s state=unavailable", process_id, alive)
+                return False
+            if self._last_exit_sample is not None and now - self._last_exit_sample < 0.5:
+                if alive is None:
+                    self._exit_samples = 0
+                return False
+            self._last_exit_sample = now
+            try:
+                posix_alive, window_alive = self.discovery.system.process_exit_evidence(process_id)
+            except Exception:
+                posix_alive = window_alive = None
+            negative = alive is False and posix_alive is False and window_alive is False
+            self._exit_samples = self._exit_samples + 1 if negative else 0
+            logger.warning(
+                "macOS liveness pid=%s appkit=%s posix=%s cgwindow=%s negative_samples=%s time=%.3f",
+                process_id, alive, posix_alive, window_alive, self._exit_samples, now)
+            if self._exit_samples >= 3:
+                self._mark_unavailable(process_exited=True)
+            return False
+
+    def _recovery_candidates(self, candidates, remembered):
+        # A different process requires a new explicit binding, not a recovery.
+        return tuple(candidate for candidate in candidates
+                     if candidate.process_id == remembered.process_id
+                     and candidate.bundle_identifier == remembered.bundle_identifier
+                     and candidate.application_name == remembered.application_name
+                     and candidate.layer in self.hints.allowed_layers
+                     and candidate.outer_geometry.width >= self.hints.minimum_width
+                     and candidate.outer_geometry.height >= self.hints.minimum_height)
+
     def refresh(self) -> WindowRefreshResult:
         with self._refresh_lock:
             with self._state_lock:
                 previous = super().snapshot
+                remembered = self._last_bound_candidate
+                if self._process_exited:
+                    return WindowRefreshResult(WindowRefreshStatus.LOST, previous, previous)
                 refresh_generation = previous.generation + 1
                 self._snapshot = WindowTargetSnapshot(
                     candidate=None,
@@ -333,6 +466,10 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                     exists=False,
                 )
             try:
+                if not self._observe_process(remembered.process_id):
+                    with self._state_lock:
+                        return WindowRefreshResult(
+                            WindowRefreshStatus.LOST, previous, super().snapshot)
                 candidates = self.discovery.enumerate_candidates()
                 current_identity = (
                     previous.candidate.runtime_identity
@@ -342,8 +479,11 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                      if candidate.runtime_identity == current_identity),
                     None,
                 )
-                if exact is not None and self._candidate_exists(exact):
+                eligible = self._recovery_candidates(candidates, remembered)
+                if exact in eligible and exact is not None and self._candidate_exists(exact):
                     with self._state_lock:
+                        if self._process_exited:
+                            return WindowRefreshResult(WindowRefreshStatus.LOST, previous, super().snapshot)
                         changed = (
                             previous.candidate is None
                             or previous.candidate.binding_signature
@@ -351,6 +491,7 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                         )
                         self._snapshot = WindowTargetSnapshot(
                             exact, refresh_generation, True)
+                        self._last_bound_candidate = exact
                         status = (
                             WindowRefreshStatus.REBOUND
                             if not previous.exists
@@ -362,16 +503,26 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                         return WindowRefreshResult(
                             status, previous, super().snapshot, candidates)
 
+                # Even an old ID/title returning is ambiguous when there are
+                # multiple credible windows after loss. Never guess a surface.
+                if len(eligible) > 1:
+                    with self._state_lock:
+                        return WindowRefreshResult(
+                            WindowRefreshStatus.MANUAL_SELECTION_REQUIRED,
+                            previous, super().snapshot, eligible)
                 selection = select_window_candidate(
-                    candidates,
+                    eligible,
                     self.hints,
                     stable_hint=self.stable_hint,
                 )
                 selected = selection.selected
                 if selected is not None and self._candidate_exists(selected):
                     with self._state_lock:
+                        if self._process_exited:
+                            return WindowRefreshResult(WindowRefreshStatus.LOST, previous, super().snapshot)
                         self._snapshot = WindowTargetSnapshot(
                             selected, refresh_generation, True)
+                        self._last_bound_candidate = selected
                         return WindowRefreshResult(
                             WindowRefreshStatus.REBOUND,
                             previous,
@@ -396,9 +547,17 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
         snapshot = self.snapshot
         candidate = snapshot.candidate
         if not snapshot.exists or candidate is None:
+            # Keep the public snapshot invalid until explicit refresh, even if
+            # this process/window comes back. Do not revive old generations.
+            with self._state_lock:
+                if self._process_exited:
+                    return False
+                remembered = self._last_bound_candidate
+            self._observe_process(remembered.process_id)
             return False
         try:
-            process_exists = self.discovery.system.process_exists(candidate.process_id)
+            process_exists = self._observe_process(
+                candidate.process_id, bound_candidate=candidate)
             live_geometry = (
                 self.discovery.system.window_geometry(
                     candidate.process_id, candidate.window_id)
@@ -413,7 +572,7 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                         and current.candidate is not None
                         and current.candidate.runtime_identity
                         == candidate.runtime_identity):
-                    self._update_candidate(None, exists=False)
+                    self._mark_unavailable()
             raise WindowDiscoveryError(
                 "failed to verify macOS window liveness") from error
         with self._state_lock:
@@ -425,7 +584,7 @@ class MacOSWindowTarget(BaseDesktopWindowTarget):
                     != candidate.runtime_identity):
                 return current.exists
             if not exists:
-                self._update_candidate(None, exists=False)
+                self._mark_unavailable()
             elif live_geometry is not None and any(
                     abs(left - right) > 0.5 for left, right in (
                         (candidate.outer_geometry.x, live_geometry.x),

@@ -84,11 +84,10 @@ def test_macos_target_refreshes_geometry_and_rebinds_by_stable_identity():
     assert update.status is WindowRefreshStatus.UPDATED
     assert target.generation == 2
 
-    system.alive = {11}
-    system.windows = (candidate(11, 21, width=1600),)
+    system.windows = (candidate(10, 21, width=1600),)
     rebound = target.refresh()
     assert rebound.status is WindowRefreshStatus.REBOUND
-    assert (target.process_id, target.window_id) == (11, 21)
+    assert (target.process_id, target.window_id) == (10, 21)
     assert target.generation == 3
     assert system.enumerations == 3
 
@@ -100,8 +99,7 @@ def test_macos_target_fails_closed_when_rebind_is_ambiguous():
     hints = WindowMatchHints(bundle_identifiers=("com.example.game",))
     target = discovery.bind(first, hints)
 
-    system.alive = {11, 12}
-    system.windows = (candidate(11, 21), candidate(12, 22))
+    system.windows = (candidate(10, 21), candidate(10, 22))
     result = target.refresh()
 
     assert result.status is WindowRefreshStatus.MANUAL_SELECTION_REQUIRED
@@ -394,6 +392,58 @@ def test_pyobjc_window_exists_checks_window_id_and_owner_pid():
         10, 20, 1280, 720,
         WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
     )
+
+
+def test_frontmost_query_tracks_native_changes_despite_stale_nsworkspace():
+    system = object.__new__(PyObjCMacOSWindowSystem)
+    current = [42]
+    calls = []
+    system._workspace = SimpleNamespace(frontmostApplication=lambda: SimpleNamespace(
+        processIdentifier=lambda: 42))
+
+    def front(_out):
+        calls.append("front")
+        return 0, (0, current[0])
+
+    def pid(serial, _out):
+        calls.append("pid")
+        return 0, serial[1]
+
+    system._application_services = SimpleNamespace(GetFrontProcess=front, GetProcessPID=pid)
+    assert system.frontmost_process_id() == 42
+    current[0] = 84
+    assert system.frontmost_process_id() == 84
+    assert calls == ["front", "pid", "front", "pid"]
+
+
+@pytest.mark.parametrize("front_result,pid_result", [
+    ((-600, None), (0, 42)),
+    ((0, None), (0, 42)),
+    ((0, (0, 42)), (-600, 42)),
+    ((0, (0, 42)), (0, None)),
+    ((0, (0, 42)), (0, 0)),
+    ((0, (0, 42)), (0, -1)),
+])
+def test_frontmost_query_fails_closed_on_native_failure(front_result, pid_result):
+    system = object.__new__(PyObjCMacOSWindowSystem)
+    system._workspace = SimpleNamespace(frontmostApplication=lambda: SimpleNamespace(
+        processIdentifier=lambda: 42))
+    system._application_services = SimpleNamespace(
+        GetFrontProcess=lambda _out: front_result,
+        GetProcessPID=lambda _serial, _out: pid_result,
+    )
+    assert system.frontmost_process_id() is None
+
+
+def test_frontmost_query_surfaces_native_exception_without_fallback():
+    system = object.__new__(PyObjCMacOSWindowSystem)
+
+    def fail(_out):
+        raise RuntimeError("native query unavailable")
+
+    system._application_services = SimpleNamespace(GetFrontProcess=fail)
+    with pytest.raises(WindowDiscoveryError, match="front process"):
+        system.frontmost_process_id()
 
 
 def test_discovery_manual_selection_returns_stable_hint_only():
