@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 from ok.device.window_target.base import WindowCoordinateSpace, WindowGeometry
 
+# Capture heartbeat, not image-content change. Shared by consumers and input.
+MAX_FRAME_AGE_SECONDS = 2.0
+
 
 @dataclass(frozen=True)
 class PixelRect:

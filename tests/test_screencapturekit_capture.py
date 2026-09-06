@@ -10,6 +10,7 @@ from ok.device.capture_methods.screencapturekit import (
     PyObjCScreenCaptureKitBackend,
     ScreenCaptureKitCaptureMethod,
     ScreenCaptureKitCaptureError,
+    _WindowGeometryPending,
     _rect_components,
     _request_automatic_capture_resolution,
     _surface_rect,
@@ -192,6 +193,44 @@ def test_content_region_fails_closed_without_verifiable_title_bar():
         backend._content_region(selected, selected_window)
 
 
+@pytest.mark.parametrize("failure", ["moving", "duplicate", "missing-titlebar", "nonstandard", "wrong-title"])
+def test_content_region_only_retries_identifiable_standard_window_geometry(failure):
+    backend = object.__new__(PyObjCScreenCaptureKitBackend)
+    backend._appkit = FakeAppKit
+    attributes = {
+        ("application", "AXWindows"): ("window", "other") if failure == "duplicate" else ("window",),
+    }
+    for window in ("window", "other"):
+        attributes.update({
+            (window, "AXPosition"): FakeAXValue(
+                SimpleNamespace(x=25, y=213), FakeApplicationServices.kAXValueCGPointType),
+            (window, "AXSize"): FakeAXValue(
+                SimpleNamespace(width=960, height=568), FakeApplicationServices.kAXValueCGSizeType),
+            (window, "AXTitle"): "Other" if failure == "wrong-title" else "Game",
+            (window, "AXSubrole"): "AXDialog" if failure == "nonstandard" else "AXStandardWindow",
+            (window, "AXTitleUIElement"): None if failure == "missing-titlebar" else "title-bar",
+        })
+    backend._application_services = FakeApplicationServices(attributes)
+    selected = candidate(x=0, y=213, width=960, height=568)
+    sc_window = SimpleNamespace(frame=lambda: ((0, 213), (960, 568)))
+    with pytest.raises(ScreenCaptureKitCaptureError) as raised:
+        backend._content_region(selected, sc_window)
+    assert isinstance(raised.value, _WindowGeometryPending) == (failure == "moving")
+
+    if failure == "moving":
+        attributes[("window", "AXPosition")] = FakeAXValue(
+            SimpleNamespace(x=0, y=213), FakeApplicationServices.kAXValueCGPointType)
+        local, content = backend._content_region(selected, sc_window)
+        assert local == WindowGeometry(0, 28, 960, 540)
+        assert content == WindowGeometry(0, 241, 960, 540, MAC_POINTS)
+
+
+def test_candidate_and_sc_geometry_disagreement_is_retryable_before_ax_access():
+    backend = object.__new__(PyObjCScreenCaptureKitBackend)
+    with pytest.raises(_WindowGeometryPending, match="geometry changed"):
+        backend._content_region(candidate(), SimpleNamespace(frame=lambda: ((101, 200), (12, 12))))
+
+
 def candidate(*, x=100, y=200, width=12, height=12, content_geometry=None):
     return WindowCandidate(
         process_id=10,
@@ -298,6 +337,109 @@ def make_capture(
 
 def sample(value=1):
     return bytearray([value, value + 1, value + 2, 255] * 144)
+
+
+class GeometryPendingBackend(FakeBackend):
+    pending = True
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = []
+
+    def start_stream(self, snapshot, *args, **kwargs):
+        self.attempts.append(snapshot)
+        if self.pending:
+            raise _WindowGeometryPending("AX and SC bounds disagree")
+        return super().start_stream(snapshot, *args, **kwargs)
+
+
+@pytest.mark.parametrize("has_old_stream", [False, True])
+def test_geometry_pending_retries_fresh_snapshot_without_publishing_stale_frames(has_old_stream):
+    now = [10.0]
+    target = FakeTarget()
+    backend = GeometryPendingBackend()
+    backend.pending = not has_old_stream
+    invalidations = []
+    capture = make_capture(
+        target=target, backend=backend, monotonic=lambda: now[0],
+        on_input_invalidated=lambda _capture, reason: invalidations.append(reason))
+    if has_old_stream:
+        backend.publish(sample())
+        assert capture.get_frame_packet() is not None
+        backend.pending = True
+        target.snapshot = WindowTargetSnapshot(candidate(x=110), 2, True)
+        assert capture.get_frame_packet() is None
+        backend.publish(sample(2))  # A late sample from the detached stream.
+    attempts = len(backend.attempts)
+    assert capture.get_frame_packet() is None
+    assert len(backend.attempts) == attempts
+    assert capture.geometry is None
+    assert invalidations
+    assert capture.diagnostics().rebuilds == 0
+
+    target.snapshot = WindowTargetSnapshot(candidate(x=140), 3, True)
+    backend.pending = False
+    now[0] += 0.11
+    assert capture.get_frame_packet() is None
+    assert target.refresh_calls == 1
+    assert backend.attempts[-1].generation == 3
+    backend.publish(sample(3))
+    packet = capture.get_frame_packet()
+    assert packet.geometry.target_generation == 3
+    assert packet.geometry.outer_geometry.x == 140
+    assert capture.diagnostics().rebuilds == int(has_old_stream)
+    capture.close()
+
+
+def test_geometry_retry_budget_does_not_reset_when_target_generation_changes():
+    now = [10.0]
+    backend = GeometryPendingBackend()
+    target = FakeTarget()
+    capture = make_capture(target=target, backend=backend, monotonic=lambda: now[0])
+    for generation, delay in enumerate((0.11, 0.21, 0.41, 0.81), 2):
+        now[0] += delay
+        target.snapshot = WindowTargetSnapshot(candidate(x=generation), generation, True)
+        assert capture.get_frame_packet() is None
+    now[0] += 1.01
+    with pytest.raises(ScreenCaptureKitCaptureError, match="retry limit"):
+        capture.get_frame_packet()
+    attempts = len(backend.attempts)
+    assert attempts == 6
+    assert capture.diagnostics().state is CaptureStreamState.FATAL
+    assert capture.geometry is None
+    now[0] += 10
+    target.snapshot = WindowTargetSnapshot(candidate(x=180), 10, True)
+    with pytest.raises(ScreenCaptureKitCaptureError, match="retry limit"):
+        capture.get_frame_packet()
+    assert len(backend.attempts) == attempts
+    capture.close()
+
+
+@pytest.mark.parametrize("action", ["close", "invalidate", "stop", "revoke", "deadline"])
+def test_geometry_backoff_is_interruptible_and_never_reopens_input(action):
+    now = [10.0]
+    backend = GeometryPendingBackend()
+    permission = FakePermissionService()
+    capture = make_capture(backend=backend, permission=permission, monotonic=lambda: now[0])
+    if action == "close":
+        capture.close()
+    elif action == "invalidate":
+        capture.invalidate("test cancellation")
+    elif action == "stop":
+        capture.exit_event.set()
+    elif action == "revoke":
+        permission.accessibility_state = PermissionState.REVOKED
+    now[0] += 5.1 if action == "deadline" else 0.11
+    backend.pending = False
+    if action in ("revoke", "deadline"):
+        with pytest.raises(ScreenCaptureKitCaptureError):
+            capture.get_frame_packet()
+    else:
+        assert capture.get_frame_packet() is None
+    assert len(backend.attempts) == 1
+    assert capture.geometry is None
+    assert capture.diagnostics().storage_size == 0
+    capture.close()
 
 
 def test_capture_invalidation_notifies_input_gate_before_resource_shutdown():
@@ -586,9 +728,11 @@ def test_stop_failure_is_fatal_and_does_not_start_a_second_stream():
     assert diagnostics.storage_size == 0
     assert diagnostics.geometry is None
 
-    capture.close()
+    with pytest.raises(ScreenCaptureKitCaptureError, match='stop failed'):
+        capture.close()
     assert len(backend.stops) == 2
-    assert capture.diagnostics().state is CaptureStreamState.CLOSED
+    assert capture.diagnostics().state is CaptureStreamState.FATAL
+    assert capture._unconfirmed_stream is backend.starts[0][0]
 
 
 def test_unexpected_stop_racing_target_rebuild_remains_fatal():

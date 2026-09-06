@@ -13,6 +13,7 @@ from typing import Callable, Protocol
 from ok.device.capture_methods.base import BaseCaptureMethod
 from ok.device.capture_methods.screencapturekit_core import (
     CaptureGeometry,
+    MAX_FRAME_AGE_SECONDS,
     LatestFrameSlot,
     PublishedFrame,
     StreamFrameMetadata,
@@ -50,6 +51,18 @@ class ScreenCaptureKitCaptureError(RuntimeError):
     pass
 
 
+class _WindowGeometryPending(ScreenCaptureKitCaptureError):
+    """Public window metadata disagrees before any native stream is created."""
+
+
+class _StreamShutdownPending(ScreenCaptureKitCaptureError):
+    """Keep a failed-start binding reachable until native shutdown is confirmed."""
+
+    def __init__(self, detail: str, binding):
+        super().__init__(detail)
+        self.binding = binding
+
+
 @dataclass(frozen=True)
 class CaptureDiagnostics:
     state: CaptureStreamState
@@ -68,6 +81,9 @@ class CaptureDiagnostics:
     storage_size: int
     geometry: CaptureGeometry | None
     last_error: str | None
+    frame_sequence: int | None = None
+    captured_monotonic: float | None = None
+    frame_geometry: CaptureGeometry | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -84,6 +100,8 @@ class CaptureDiagnostics:
             "rebuilds": self.rebuilds,
             "fps": self.fps,
             "frame_age_seconds": self.frame_age_seconds,
+            "frame_sequence": self.frame_sequence,
+            "captured_monotonic": self.captured_monotonic,
             "storage_size": self.storage_size,
             "geometry": self.geometry.to_dict() if self.geometry else None,
             "last_error": self.last_error,
@@ -110,6 +128,9 @@ class _PyObjCStreamBinding:
     output: object
     delegate: object
     queue: object
+    output_removed: bool = False
+    stop_confirmed: bool = False
+    drained: bool = False
 
 
 def _objc_value(instance, name: str):
@@ -249,12 +270,15 @@ class PyObjCScreenCaptureKitBackend:
                 return self
 
             def stream_didOutputSampleBuffer_ofType_(self, _stream, sample_buffer, output_type):
+                callbacks = self._callbacks
+                if callbacks is None:
+                    return
                 (
                     on_sample,
                     on_sample_error,
                     source_rect,
                     configured_global_content,
-                ) = self._callbacks
+                ) = callbacks
                 try:
                     with self._backend._objc.autorelease_pool():
                         self._deliver(
@@ -368,7 +392,9 @@ class PyObjCScreenCaptureKitBackend:
                 return self
 
             def stream_didStopWithError_(self, _stream, error):
-                self._callback(_error_description(error))
+                callback = self._callback
+                if callback is not None:
+                    callback(_error_description(error))
 
         _PYOBJC_DELEGATE_CLASS = OKScreenCaptureKitStreamDelegate
         return _PYOBJC_DELEGATE_CLASS
@@ -471,28 +497,38 @@ class PyObjCScreenCaptureKitBackend:
             (first.height, second.height),
         ))
 
-    def _content_region(
-            self,
-            candidate: WindowCandidate,
-            selected_window) -> tuple[WindowGeometry, WindowGeometry]:
-        """Return stream-local source points and global logical content points."""
-        outer = _surface_rect(_objc_value(selected_window, "frame"))
+    def _matching_ax_window(self, candidate: WindowCandidate, outer: WindowGeometry):
+        """Match the same standard window for capture and explicit preparation."""
         if not self._same_rect(outer, candidate.outer_geometry):
-            raise ScreenCaptureKitCaptureError(
+            raise _WindowGeometryPending(
                 "macOS window geometry changed before capture stream creation")
         application_services = self._application_services
         application = application_services.AXUIElementCreateApplication(
             candidate.process_id)
         windows = self._ax_attribute(application, "AXWindows") or ()
         matching = []
+        moving = []
+        same_title = []
         for window in windows:
-            frame = self._ax_window_frame(window)
-            if frame is None or not self._same_rect(frame, outer):
-                continue
             title = str(self._ax_attribute(window, "AXTitle") or "").strip()
+            if title and title == candidate.title.strip():
+                same_title.append(window)
+            frame = self._ax_window_frame(window)
+            if frame is None:
+                continue
             if candidate.title and title and title != candidate.title.strip():
                 continue
+            if not self._same_rect(frame, outer):
+                if (
+                        title and title == candidate.title.strip()
+                        and self._ax_attribute(window, "AXSubrole") == "AXStandardWindow"
+                        and self._ax_attribute(window, "AXTitleUIElement") is not None):
+                    moving.append(window)
+                continue
             matching.append(window)
+        if not matching and len(moving) == 1 and len(same_title) == 1:
+            raise _WindowGeometryPending(
+                "ScreenCaptureKit and Accessibility window geometry have not settled")
         if len(matching) != 1:
             raise ScreenCaptureKitCaptureError(
                 "Accessibility permission and one matching AXWindow are required "
@@ -507,6 +543,15 @@ class PyObjCScreenCaptureKitBackend:
         if self._ax_attribute(ax_window, "AXTitleUIElement") is None:
             raise ScreenCaptureKitCaptureError(
                 "unsupported macOS window without a verifiable standard title bar")
+        return ax_window
+
+    def _content_region(
+            self,
+            candidate: WindowCandidate,
+            selected_window) -> tuple[WindowGeometry, WindowGeometry]:
+        """Return stream-local source points and global logical content points."""
+        outer = _surface_rect(_objc_value(selected_window, "frame"))
+        self._matching_ax_window(candidate, outer)
         content = self._appkit.NSWindow.contentRectForFrameRect_styleMask_(
             self._appkit.NSMakeRect(0, 0, outer.width, outer.height),
             self._appkit.NSWindowStyleMaskTitled,
@@ -531,6 +576,73 @@ class PyObjCScreenCaptureKitBackend:
             WindowCoordinateSpace.MACOS_GLOBAL_LOGICAL_POINTS,
         )
         return local, global_content
+
+    def request_content_size(
+            self, target, width: int, height: int, *, timeout: float,
+            is_stopping: Callable[[], bool]):
+        """One public AXSize request; caller must close capture/input first.
+
+        This is a request, not capture-size evidence. A new stream must verify it.
+        No activation, position change, system display change or retry is issued.
+        """
+        if not target.is_foreground():
+            raise ScreenCaptureKitCaptureError("window preparation requires the target foreground")
+        snapshot = target.snapshot
+        candidate = snapshot.candidate
+        if candidate is None or not snapshot.exists:
+            raise ScreenCaptureKitCaptureError("window preparation target disappeared")
+        content = self._shareable_content(timeout)
+        selected = []
+        for window in _objc_value(content, "windows"):
+            application = _objc_value(window, "owningApplication")
+            if (application is not None
+                    and int(_objc_value(window, "windowID")) == candidate.window_id
+                    and int(_objc_value(application, "processID")) == candidate.process_id):
+                selected.append(window)
+        if len(selected) != 1:
+            raise ScreenCaptureKitCaptureError("window preparation requires the same unique window")
+        window = selected[0]
+        local, _ = self._content_region(candidate, window)
+        outer = _surface_rect(_objc_value(window, "frame"))
+        scale = self._display_scale(content, window)
+        requested_width = width / scale + outer.width - local.width
+        requested_height = height / scale + outer.height - local.height
+        if not all(math.isfinite(v) and v > 0 for v in (requested_width, requested_height)):
+            raise ScreenCaptureKitCaptureError("invalid requested logical window size")
+        ax_window = self._matching_ax_window(candidate, outer)
+        if (self._ax_attribute(ax_window, "AXFullScreen")
+                or self._ax_attribute(ax_window, "AXMinimized")):
+            raise ScreenCaptureKitCaptureError("window preparation requires windowed, non-minimized mode")
+        services = self._application_services
+        error, settable = services.AXUIElementIsAttributeSettable(ax_window, "AXSize", None)
+        if int(error) != 0 or not settable:
+            raise ScreenCaptureKitCaptureError("selected window does not expose a writable AXSize")
+        value = services.AXValueCreate(
+            services.kAXValueCGSizeType,
+            self._quartz.CGSizeMake(requested_width, requested_height))
+        if value is None:
+            raise ScreenCaptureKitCaptureError("could not construct AXSize value")
+        # Recheck after the native discovery/AX calls. Never activate to rescue
+        # a lost-focus request and never write to a rebound/stale AX window.
+        if (not services.AXIsProcessTrusted()
+                or not self._quartz.CGPreflightScreenCaptureAccess()
+                or is_stopping()
+                or self._display_scale(content, window) != scale
+                or self._matching_ax_window(candidate, outer) != ax_window
+                or not target.is_foreground()
+                or target.snapshot != snapshot):
+            raise ScreenCaptureKitCaptureError("window preparation target, geometry or permission changed")
+        error = services.AXUIElementSetAttributeValue(ax_window, "AXSize", value)
+        if int(error) != 0:
+            raise ScreenCaptureKitCaptureError(f"AXSize request rejected: {int(error)}")
+        return {
+            "requested_frame_size": [width, height],
+            "requested_outer_size": [requested_width, requested_height],
+            "display_scale": scale,
+            "original_outer_geometry": candidate.outer_geometry.to_dict(),
+            "window_id": candidate.window_id,
+            "process_id": candidate.process_id,
+        }
 
     def start_stream(
             self,
@@ -626,34 +738,96 @@ class PyObjCScreenCaptureKitBackend:
             result["error"] = error
             completed.set()
 
-        stream.startCaptureWithCompletionHandler_(started)
-        if not completed.wait(timeout):
-            stream.stopCaptureWithCompletionHandler_(None)
+        binding = _PyObjCStreamBinding(stream, output, delegate, queue)
+        try:
+            stream.startCaptureWithCompletionHandler_(started)
+            if not completed.wait(timeout):
+                raise ScreenCaptureKitCaptureError(
+                    f"ScreenCaptureKit start timed out after {timeout:.1f}s")
+            error = result.get("error")
+            if error is not None:
+                raise ScreenCaptureKitCaptureError(
+                    f"ScreenCaptureKit failed to start: {_error_description(error)}")
+        except Exception as error:
+            try:
+                self.stop_stream(binding, timeout=timeout)
+            except Exception as stop_error:
+                raise _StreamShutdownPending(
+                    f"{error}; failed-start cleanup is unconfirmed: {stop_error}",
+                    binding,
+                ) from error
+            raise
+        return binding
+
+    def _check_shutdown_thread(self) -> None:
+        # A synchronous drain of our own serial output queue cannot complete.
+        # Checking before capture's lifecycle lock also avoids a callback waiting
+        # on a closer that is already draining this queue.
+        if self._dispatch.dispatch_queue_get_label(None) == b"com.ok-script.screencapturekit.frames":
             raise ScreenCaptureKitCaptureError(
-                f"ScreenCaptureKit start timed out after {timeout:.1f}s")
-        error = result.get("error")
-        if error is not None:
-            stream.stopCaptureWithCompletionHandler_(None)
-            raise ScreenCaptureKitCaptureError(
-                f"ScreenCaptureKit failed to start: {_error_description(error)}")
-        return _PyObjCStreamBinding(stream, output, delegate, queue)
+                "ScreenCaptureKit shutdown must run outside the frame callback queue")
 
     def stop_stream(self, binding, *, timeout: float) -> None:
+        self._check_shutdown_thread()
+        if binding.drained:
+            return
+        deadline = time.monotonic() + timeout
+        errors = []
+        # This rejects callbacks that were queued natively but have not entered
+        # Python yet. An in-flight callback keeps its local callbacks reference;
+        # the native serial-queue fence below waits for it to return completely.
+        binding.output._callbacks = None
+        binding.delegate._callback = None
+        if not binding.output_removed:
+            try:
+                removed, error = binding.stream.removeStreamOutput_type_error_(
+                    binding.output,
+                    self._screen_capture_kit.SCStreamOutputTypeScreen,
+                    None,
+                )
+                if not removed or error is not None:
+                    raise ScreenCaptureKitCaptureError(
+                        f"failed to remove ScreenCaptureKit stream output: {_error_description(error)}")
+                binding.output_removed = True
+            except Exception as error:
+                errors.append(str(error))
+
         completed = threading.Event()
         result: dict[str, object] = {}
 
         def stopped(error):
             result["error"] = error
+            if error is None:
+                binding.stop_confirmed = True
             completed.set()
 
-        binding.stream.stopCaptureWithCompletionHandler_(stopped)
-        if not completed.wait(timeout):
-            raise ScreenCaptureKitCaptureError(
-                f"ScreenCaptureKit stop timed out after {timeout:.1f}s")
-        error = result.get("error")
-        if error is not None:
-            raise ScreenCaptureKitCaptureError(
-                f"ScreenCaptureKit failed to stop: {_error_description(error)}")
+        if not binding.stop_confirmed:
+            try:
+                binding.stream.stopCaptureWithCompletionHandler_(stopped)
+                if not completed.wait(max(0.0, deadline - time.monotonic())):
+                    errors.append(f"ScreenCaptureKit stop timed out after {timeout:.1f}s")
+                elif result.get("error") is not None:
+                    errors.append(
+                        f"ScreenCaptureKit failed to stop: {_error_description(result['error'])}")
+            except Exception as error:
+                errors.append(f"ScreenCaptureKit stop failed: {error}")
+
+        try:
+            # stopCapture's completion is not an output-queue drain. A dispatch
+            # group completes only after its fence block has returned through
+            # the Python bridge, unlike setting a Python Event inside a block.
+            group = self._dispatch.dispatch_group_create()
+            self._dispatch.dispatch_group_async(group, binding.queue, lambda: None)
+            remaining_ns = max(0, int((deadline - time.monotonic()) * 1_000_000_000))
+            wait_until = self._dispatch.dispatch_time(
+                self._dispatch.DISPATCH_TIME_NOW, remaining_ns)
+            if self._dispatch.dispatch_group_wait(group, wait_until) != 0:
+                errors.append(f"ScreenCaptureKit output queue drain timed out after {timeout:.1f}s")
+        except Exception as error:
+            errors.append(f"ScreenCaptureKit output queue drain failed: {error}")
+        if errors:
+            raise ScreenCaptureKitCaptureError("; ".join(errors))
+        binding.drained = True
 
 
 class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
@@ -699,6 +873,10 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
         self._dropped_stale = 0
         self._conversion_errors = 0
         self._rebuilds = 0
+        self._stream_starts = 0
+        self._geometry_retry_started: float | None = None
+        self._geometry_retry_at = 0.0
+        self._geometry_retries = 0
         self._sequence = 0
         self._frame_times: deque[float] = deque(maxlen=120)
         self._latest_geometry: CaptureGeometry | None = None
@@ -777,6 +955,10 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                     expected_capture_generation is not None
                     and expected_capture_generation != self._capture_generation):
                 return False
+            if self._stream is not None:
+                # A native error callback does not prove that pending output
+                # callbacks have finished. Keep the binding for close's drain.
+                self._unconfirmed_stream = self._stream
             self._stream = None
             self._capture_generation += 1
             self._state = CaptureStreamState.FATAL
@@ -795,6 +977,8 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
 
     def invalidate(self, reason: str = "capture-invalidated") -> None:
         """Immediately reject the current generation before refresh/rebind."""
+        if isinstance(self.backend, PyObjCScreenCaptureKitBackend):
+            self.backend._check_shutdown_thread()
         with self._lifecycle_lock:
             stream = self._detach_stream()
             with self._state_lock:
@@ -811,7 +995,7 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
     def _synchronize_stream(self) -> None:
         with self._lifecycle_lock:
             with self._state_lock:
-                if self._state is CaptureStreamState.CLOSED:
+                if self._state in (CaptureStreamState.CLOSED, CaptureStreamState.FATAL):
                     return
                 if self._unconfirmed_stream is not None:
                     self._state = CaptureStreamState.FATAL
@@ -833,6 +1017,21 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 if stop_error is not None:
                     self._set_fatal(stop_error)
                 return
+
+            retry_started = self._geometry_retry_started
+            if retry_started is not None:
+                if self.exit_event.is_set():
+                    self._set_unavailable(
+                        CaptureStreamState.TARGET_UNAVAILABLE,
+                        "capture is stopping; window geometry retry cancelled",
+                    )
+                    return
+                now = self._monotonic()
+                if now - retry_started >= 5.0:
+                    self._set_fatal("macOS window geometry did not settle within 5.0s")
+                    return
+                if now < self._geometry_retry_at:
+                    return
 
             try:
                 with self._state_lock:
@@ -877,6 +1076,8 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 return
 
             old_stream = self._detach_stream() if current_stream is not None else None
+            if old_stream is not None:
+                self._notify_input_invalidated("macOS capture geometry changed; rebuilding stream")
             stop_error = self._stop_binding(old_stream)
             if stop_error is not None:
                 self._set_fatal(stop_error, blocked_generation=snapshot.generation)
@@ -892,8 +1093,6 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 self._target_generation = snapshot.generation
                 self._state = CaptureStreamState.STARTING
                 self._last_error = None
-                if current_generation >= 0:
-                    self._rebuilds += 1
 
             def on_sample(buffer, width, height, bytes_per_row, metadata):
                 self._on_sample(
@@ -915,10 +1114,18 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                     lambda detail: self._on_sample_error(
                         capture_generation, detail),
                     frames_per_second=self.frames_per_second,
-                    timeout=self.lifecycle_timeout,
+                    timeout=(
+                        min(self.lifecycle_timeout, max(
+                            0.001, 5.0 - (self._monotonic() - retry_started)))
+                        if retry_started is not None else self.lifecycle_timeout),
                 )
             except Exception as error:
                 detail = str(error)
+                if isinstance(error, _StreamShutdownPending):
+                    with self._state_lock:
+                        self._unconfirmed_stream = error.binding
+                    self._set_fatal(detail, expected_capture_generation=capture_generation)
+                    return
                 permission = self._permission_status()
                 if not permission.granted:
                     state = (
@@ -932,6 +1139,30 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                             f"{permission.kind.value} at {permission.settings_path}"),
                     )
                     return
+                if isinstance(error, _WindowGeometryPending):
+                    now = self._monotonic()
+                    with self._state_lock:
+                        if (
+                                self._state is not CaptureStreamState.STARTING
+                                or capture_generation != self._capture_generation):
+                            return
+                        if self._geometry_retry_started is None:
+                            self._geometry_retry_started = now
+                        delays = (0.1, 0.2, 0.4, 0.8, 1.0)
+                        retry = (
+                            self._geometry_retries < len(delays)
+                            and now - self._geometry_retry_started < 5.0)
+                        if retry:
+                            self._geometry_retry_at = now + delays[self._geometry_retries]
+                            self._geometry_retries += 1
+                            self._needs_rebuild = True
+                    if retry:
+                        self._set_unavailable(
+                            CaptureStreamState.TARGET_UNAVAILABLE,
+                            f"{detail}; retrying with fresh window metadata",
+                        )
+                        return
+                    detail = f"macOS window geometry retry limit reached: {detail}"
                 self._set_fatal(
                     detail,
                     blocked_generation=snapshot.generation,
@@ -947,6 +1178,11 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                     self._stream = stream
                     self._state = CaptureStreamState.RUNNING
                     self._blocked_generation = None
+                    self._geometry_retry_started = None
+                    self._geometry_retries = 0
+                    if self._stream_starts:
+                        self._rebuilds += 1
+                    self._stream_starts += 1
                     stale_stream = None
             self._stop_binding(stale_stream)
 
@@ -1095,6 +1331,10 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
     def get_frame_packet(self) -> PublishedFrame | None:
         """Return the latest frame together with its immutable geometry."""
         self._synchronize_stream()
+        return self._read_frame_packet()
+
+    def _read_frame_packet(self) -> PublishedFrame | None:
+        """Read only: never discover a window or create/rebuild a stream."""
         with self._state_lock:
             snapshot = self.target.snapshot
             state = self._state
@@ -1109,10 +1349,86 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             if snapshot.generation != target_generation or not snapshot.exists:
                 self._slot.clear()
                 return None
-            return self._slot.read(
+            packet = self._slot.read(
                 target_generation=target_generation,
                 capture_generation=capture_generation,
             )
+            if packet is not None:
+                age = self._monotonic() - packet.captured_monotonic
+                if not math.isfinite(age) or not 0 <= age <= MAX_FRAME_AGE_SECONDS:
+                    return None
+            return packet
+
+    def await_fresh_frame(self, timeout=8.0, *, poll_interval=0.1, sleep=time.sleep):
+        """Final input revalidation of an already prepared provider, no recovery."""
+        return self.wait_until_ready(
+            timeout, poll_interval=poll_interval, sleep=sleep, recover=False)
+
+    def wait_until_ready(self, timeout=8.0, *, poll_interval=0.1, sleep=time.sleep, recover=True):
+        """Explicit start/resume preflight; never arms input or activates a target.
+
+        Poll the persistent stream even while the input gate is closed. A lost
+        window may be reselected by the existing identity/ambiguity rules, but
+        only this explicit request retries discovery; ordinary input never does.
+        """
+        if timeout <= 0 or poll_interval <= 0:
+            raise ValueError("readiness timeout and poll interval must be positive")
+        started = self._monotonic()
+        deadline = started + timeout
+        with self._state_lock:
+            sequence = self._sequence
+        next_refresh = started
+        try:
+            while not self.exit_event.is_set():
+                permission = self._permission_status()
+                if not permission.granted:
+                    raise ScreenCaptureKitCaptureError(
+                        f"{permission.kind.value}: {permission.state.value}; "
+                        f"grant permission at {permission.settings_path}")
+                with self._state_lock:
+                    if self._state in (CaptureStreamState.CLOSED, CaptureStreamState.FATAL):
+                        raise ScreenCaptureKitCaptureError(self._last_error or self._state.value)
+                now = self._monotonic()
+                if now >= deadline:
+                    break
+                target_exists = self.target.exists()
+                if not recover:
+                    with self._state_lock:
+                        prepared = (self._state is CaptureStreamState.RUNNING
+                                    and self._stream is not None and not self._needs_rebuild
+                                    and self._target_generation == self.target.snapshot.generation)
+                    if not target_exists or not prepared:
+                        raise ScreenCaptureKitCaptureError(
+                            'MAC_CAPTURE_NOT_PREPARED: reconnect capture before starting input')
+                if recover and not target_exists and now >= next_refresh:
+                    if getattr(self.target, "unavailable_code", None) == "MAC_TARGET_EXITED":
+                        raise ScreenCaptureKitCaptureError(
+                            "MAC_TARGET_EXITED: game process ended; explicitly bind the new game process")
+                    result = self.target.refresh()
+                    if getattr(getattr(result, "status", None), "value", None) == "manual-selection-required":
+                        raise ScreenCaptureKitCaptureError(
+                            "MAC_TARGET_UNAVAILABLE: multiple credible windows; manually select the game window")
+                    next_refresh = self._monotonic() + 0.5
+                packet = self.get_frame_packet() if recover else self._read_frame_packet()
+                diagnostics = self.diagnostics()
+                snapshot = self.target.snapshot
+                if (self._monotonic() < deadline
+                        and packet is not None and packet.sequence > sequence
+                        and packet.captured_monotonic >= started
+                        and diagnostics.state is CaptureStreamState.RUNNING
+                        and snapshot.exists and snapshot.candidate is not None
+                        and packet.geometry == diagnostics.geometry
+                        and packet.geometry.target_generation == snapshot.generation
+                        and diagnostics.target_generation == snapshot.generation
+                        and packet.geometry.capture_generation == diagnostics.capture_generation):
+                    return packet
+                sleep(min(poll_interval, max(0, deadline - self._monotonic())))
+            raise ScreenCaptureKitCaptureError(
+                "MAC_CAPTURE_REBIND_FAILED: reconnect timed out or was cancelled; "
+                "check game window and permissions, then explicitly resume")
+        except Exception:
+            self._notify_input_invalidated("macOS capture readiness failed; input remains stopped")
+            raise
 
     def do_get_frame(self):
         published = self.get_frame_packet()
@@ -1144,16 +1460,17 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
         return geometry.frame_pixel_to_global_point(x, y)
 
     def diagnostics(self) -> CaptureDiagnostics:
-        now = self._monotonic()
         with self._state_lock:
+            now = self._monotonic()
             times = tuple(self._frame_times)
             if len(times) >= 2 and times[-1] > times[0]:
                 fps = (len(times) - 1) / (times[-1] - times[0])
             else:
                 fps = 0.0
-            frame_age = (
-                max(0.0, now - self._latest_frame_time)
-                if self._latest_frame_time is not None else None)
+            packet = self._slot.read(
+                target_generation=self._target_generation,
+                capture_generation=self._capture_generation)
+            frame_age = now - packet.captured_monotonic if packet is not None else None
             return CaptureDiagnostics(
                 state=self._state,
                 target_generation=self._target_generation,
@@ -1171,9 +1488,33 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
                 storage_size=self._slot.storage_size,
                 geometry=self._latest_geometry,
                 last_error=self._last_error,
+                frame_sequence=packet.sequence if packet is not None else None,
+                captured_monotonic=packet.captured_monotonic if packet is not None else None,
+                frame_geometry=packet.geometry if packet is not None else None,
             )
 
+    def request_content_size(self, width: int, height: int) -> dict[str, object]:
+        """Close this capture permanently, then request a one-off window size.
+
+        Explicit startup preparation only. Its input invalidation callback must
+        be wired normally. The caller must verify a new capture before input.
+        """
+        if any(type(v) is not int or v <= 0 for v in (width, height)):
+            raise ValueError("content dimensions must be positive integer pixels")
+        request = getattr(self.backend, "request_content_size", None)
+        if not callable(request):
+            raise ScreenCaptureKitCaptureError("capture backend does not support window preparation")
+        self.close()  # Failure aborts before AXSize; old frames can never revive.
+        permission = self._permission_status()
+        if not permission.granted or self.exit_event.is_set():
+            raise ScreenCaptureKitCaptureError("window preparation permission missing or app stopping")
+        return request(
+            self.target, width, height, timeout=self.lifecycle_timeout,
+            is_stopping=self.exit_event.is_set)
+
     def close(self):
+        if isinstance(self.backend, PyObjCScreenCaptureKitBackend):
+            self.backend._check_shutdown_thread()
         self._notify_input_invalidated("ScreenCaptureKit capture closed")
         with self._lifecycle_lock:
             with self._state_lock:
@@ -1183,13 +1524,15 @@ class ScreenCaptureKitCaptureMethod(BaseCaptureMethod):
             stream = self._detach_stream()
             with self._state_lock:
                 unconfirmed_stream = self._unconfirmed_stream
-                self._unconfirmed_stream = None
-            with self._state_lock:
-                self._state = CaptureStreamState.CLOSED
-            self._stop_binding(stream)
+            errors = []
+            stop_error = self._stop_binding(stream)
+            if stop_error is not None:
+                errors.append(stop_error)
             if unconfirmed_stream is not None and unconfirmed_stream is not stream:
-                self._stop_binding(unconfirmed_stream)
-            with self._state_lock:
-                # Closing is terminal. Drop our final references even when the
-                # native stop completion could not be confirmed.
-                self._unconfirmed_stream = None
+                stop_error = self._stop_binding(unconfirmed_stream)
+                if stop_error is not None:
+                    errors.append(stop_error)
+            if errors:
+                detail = "; ".join(errors)
+                self._set_fatal(detail)
+                raise ScreenCaptureKitCaptureError(detail)
