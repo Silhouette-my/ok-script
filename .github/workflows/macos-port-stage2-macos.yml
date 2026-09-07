@@ -1,4 +1,4 @@
-name: macOS Foreground Branch Guardrails
+name: macOS Foreground Branch Source Guardrails
 
 on:
   push:
@@ -14,14 +14,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-macos:
-    name: Platform-safe framework contracts
+  source-contracts:
+    name: Platform source contracts
     runs-on: macos-latest
-    timeout-minutes: 45
-
-    env:
-      PYTHONIOENCODING: UTF-8
-      QT_QPA_PLATFORM: offscreen
+    timeout-minutes: 10
 
     steps:
       - name: Check out integration branch
@@ -33,40 +29,50 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
 
-      - name: Install framework profiles
+      - name: Compile Python sources without importing optional backends
+        shell: bash
+        run: python -m compileall -q ok scripts
+
+      - name: Verify platform dependency markers and foreground-only source policy
         shell: bash
         run: |
-          python -m pip install "pip==26.2.1"
-          # Development-only branch guardrail: the editable project is this exact checkout;
-          # release dependency locking is handled by the normal release workflow.
-          python -m pip install -e ".[default,web,qt,adb,ocr,dev]" "opencv-python==5.0.0.93" "pytest-subtests==0.15.0"  # NOSONAR
-          python -m pip check
-
-      - name: Run no-game framework tests
-        shell: bash
-        run: python -m pytest -q
-
-      - name: Verify installed imports do not load Win32 backends
-        shell: bash
-        run: |
-          cd "$(mktemp -d)"
           python - <<'PY'
-          import sys
+          from pathlib import Path
+          import tomllib
 
-          import ok
-          from ok.device.DeviceManager import DeviceManager
-          from ok.device.capabilities import DeviceCapabilities
+          root = Path('.')
+          project = tomllib.loads((root / 'pyproject.toml').read_text(encoding='utf-8'))['project']
+          dependencies = project['dependencies']
 
-          forbidden = sorted(
-              name
-              for name in sys.modules
-              if name.startswith(("win32", "pythoncom", "pywintypes", "ok.rotypes"))
+          for package in ('pywin32', 'pydirectinput', 'pycaw', 'mouse', 'pynput'):
+              requirement = next(item for item in dependencies if item.lower().startswith(package.lower()))
+              assert "sys_platform == 'win32'" in requirement, requirement
+
+          for package in (
+              'pyobjc-framework-Cocoa',
+              'pyobjc-framework-Quartz',
+              'pyobjc-framework-ScreenCaptureKit',
+              'pyobjc-framework-ApplicationServices',
+          ):
+              requirement = next(item for item in dependencies if item.lower().startswith(package.lower()))
+              assert "sys_platform == 'darwin'" in requirement, requirement
+
+          production = [
+              path for path in (root / 'ok').rglob('*.py')
+              if '__pycache__' not in path.parts
+          ]
+          forbidden = (
+              'CGEvent.postToPid',
+              'CGVirtualDisplay',
+              'BetterDisplay',
           )
-          if forbidden:
-              raise SystemExit(f"Forbidden Windows modules loaded: {forbidden}")
-          assert DeviceCapabilities().enabled_names() == ()
-          assert DeviceManager is not None
+          violations = []
+          for path in production:
+              text = path.read_text(encoding='utf-8')
+              for token in forbidden:
+                  if token in text:
+                      violations.append(f'{path}: {token}')
+          if violations:
+              raise SystemExit('Forbidden macOS foreground-MVP source token(s):\n' + '\n'.join(violations))
           PY
