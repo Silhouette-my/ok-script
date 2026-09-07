@@ -39,8 +39,8 @@ jobs:
       - name: Install framework profiles
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[default,web,qt,adb,ocr,dev]" opencv-python pytest-subtests
+          python -m pip install "pip==26.2.1"
+          python -m pip install -e ".[default,web,qt,adb,ocr,dev]" "opencv-python==5.0.0.93" "pytest-subtests==0.15.0"
           python -m pip check
 
       - name: Run no-game framework tests

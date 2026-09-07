@@ -565,8 +565,12 @@ class DeviceManager:
         if self.macos_window_config is None:
             return
         target = self.window_target
-        target_bound = bool(target is not None and target.exists())
-        snapshot = target.snapshot if target_bound else None
+        if target is None:
+            target_bound = False
+            snapshot = None
+        else:
+            target_bound = bool(target.exists())
+            snapshot = target.snapshot if target_bound else None
         candidate = snapshot.candidate if snapshot is not None else None
         nick = (
             candidate.application_name or candidate.title

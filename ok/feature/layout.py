@@ -17,7 +17,7 @@ def anchored_point(x, y, width, height, reference_ratio, *, hcenter=False, vcent
     scale = min(width / reference_width, 1.0)
 
     def axis(value, reference, actual, center):
-        if center or value == 0.5:
+        if center or math.isclose(value, 0.5, rel_tol=0.0, abs_tol=1e-12):
             return round(actual / 2 + (value - 0.5) * reference * scale)
         if value > 0.5:
             return round(actual - (1 - value) * reference * scale)

@@ -261,7 +261,7 @@ def _check_posix_mutex(wait_time=5, kill_wait_time=3):
     import fcntl
 
     path = os.getcwd()
-    mutex_name = hashlib.md5(path.encode()).hexdigest()
+    mutex_name = hashlib.sha256(path.encode()).hexdigest()
     owner_file = os.path.join(tempfile.gettempdir(), f'ok-script-{mutex_name}.pid')
     lock_file = open(owner_file, 'a+', encoding='ascii')
     deadline = time.monotonic() + max(0, wait_time)
@@ -307,7 +307,7 @@ def _check_windows_mutex(wait_time=5, kill_wait_time=3):
     _ERROR_ALREADY_EXISTS = 183
     path = os.getcwd()
     # Try to create a named mutex
-    mutex_name = hashlib.md5(path.encode()).hexdigest()
+    mutex_name = hashlib.sha256(path.encode()).hexdigest()
     owner_file = os.path.join(tempfile.gettempdir(), f'ok-script-{mutex_name}.pid')
     mutex = _CreateMutex(0, False, mutex_name)
     if not mutex:
